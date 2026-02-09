@@ -1,4 +1,4 @@
-#Add on on this version : 
+#Add ons on this version : 
 
 -2047 damage limit was removed
 -Cliking on the exit button on the UI will exit the game correctly 
