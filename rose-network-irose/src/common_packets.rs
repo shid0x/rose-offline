@@ -846,22 +846,14 @@ impl PacketWriteStatusEffects for PacketWriter {
     }
 }
 
-#[bitfield]
-#[derive(Clone, Copy)]
-pub struct PacketServerDamage {
-    amount: B11,
-    action: B5,
-}
-
 pub trait PacketReadDamage {
-    fn read_damage_u16(&mut self) -> Result<(Damage, bool, bool), PacketError>;
+    fn read_damage(&mut self) -> Result<(Damage, bool, bool), PacketError>;
 }
 
 impl<'a> PacketReadDamage for PacketReader<'a> {
-    fn read_damage_u16(&mut self) -> Result<(Damage, bool, bool), PacketError> {
-        let server_damage =
-            PacketServerDamage::from_bytes(self.read_fixed_length_bytes(2)?.try_into().unwrap());
-        let action = server_damage.action();
+    fn read_damage(&mut self) -> Result<(Damage, bool, bool), PacketError> {
+        let amount = self.read_i32()?;
+        let action = self.read_u8()?;
 
         let is_immediate = (action & 0x02) != 0;
         let apply_hit_stun = (action & 0x04) != 0;
@@ -870,7 +862,7 @@ impl<'a> PacketReadDamage for PacketReader<'a> {
 
         Ok((
             Damage {
-                amount: server_damage.amount() as u32,
+                amount,
                 is_critical,
                 apply_hit_stun,
             },
@@ -881,11 +873,11 @@ impl<'a> PacketReadDamage for PacketReader<'a> {
 }
 
 pub trait PacketWriteDamage {
-    fn write_damage_u16(&mut self, damage: &Damage, is_killed: bool, is_immediate: bool);
+    fn write_damage(&mut self, damage: &Damage, is_killed: bool, is_immediate: bool);
 }
 
 impl PacketWriteDamage for PacketWriter {
-    fn write_damage_u16(&mut self, damage: &Damage, is_killed: bool, is_immediate: bool) {
+    fn write_damage(&mut self, damage: &Damage, is_killed: bool, is_immediate: bool) {
         let mut action = 0u8;
 
         if is_immediate {
@@ -904,13 +896,8 @@ impl PacketWriteDamage for PacketWriter {
             action |= 0x10;
         }
 
-        let damage = PacketServerDamage::new()
-            .with_amount(damage.amount.min(2047) as u16)
-            .with_action(action);
-
-        for b in damage.into_bytes().iter() {
-            self.write_u8(*b);
-        }
+        self.write_i32(damage.amount);
+        self.write_u8(action);
     }
 }
 

@@ -865,7 +865,7 @@ impl TryFrom<&Packet> for PacketServerDamageEntity {
         let mut reader = PacketReader::from(packet);
         let attacker_entity_id = reader.read_entity_id()?;
         let defender_entity_id = reader.read_entity_id()?;
-        let (damage, is_killed, is_immediate) = reader.read_damage_u16()?;
+        let (damage, is_killed, is_immediate) = reader.read_damage()?;
 
         Ok(Self {
             attacker_entity_id,
@@ -882,7 +882,7 @@ impl From<&PacketServerDamageEntity> for Packet {
         let mut writer = PacketWriter::new(ServerPackets::DamageEntity as u16);
         writer.write_entity_id(packet.attacker_entity_id);
         writer.write_entity_id(packet.defender_entity_id);
-        writer.write_damage_u16(&packet.damage, packet.is_killed, packet.is_immediate);
+        writer.write_damage(&packet.damage, packet.is_killed, packet.is_immediate);
         writer.into()
     }
 }
@@ -2517,11 +2517,12 @@ impl TryFrom<&Packet> for PacketServerLevelUpSkillResult {
         }
 
         let mut reader = PacketReader::from(packet);
+        let result_code = reader.read_u8()?;
         let skill_slot = reader.read_skill_slot_u8()?;
         let skill_id = SkillId::new(reader.read_u16()?);
         let skill_points = SkillPoints::new(reader.read_u16()? as u32);
 
-        Ok(match reader.read_u8()? {
+        Ok(match result_code {
             0 => Self::Success {
                 skill_slot,
                 skill_id: skill_id.ok_or(PacketError::InvalidPacket)?,
@@ -3149,7 +3150,7 @@ impl TryFrom<&Packet> for PacketServerApplySkillDamage {
         let caster_entity_id = reader.read_entity_id()?;
         let skill_effect_data =
             SkillEffectData::from_bytes(reader.read_fixed_length_bytes(3)?.try_into().unwrap());
-        let (damage, is_killed, is_immediate) = reader.read_damage_u16()?;
+        let (damage, is_killed, is_immediate) = reader.read_damage()?;
 
         let skill_id =
             SkillId::new(skill_effect_data.skill_id()).ok_or(PacketError::InvalidPacket)?;
@@ -3187,7 +3188,7 @@ impl From<&PacketServerApplySkillDamage> for Packet {
             writer.write_u8(*b);
         }
 
-        writer.write_damage_u16(&packet.damage, packet.is_killed, packet.is_immediate);
+        writer.write_damage(&packet.damage, packet.is_killed, packet.is_immediate);
         writer.into()
     }
 }

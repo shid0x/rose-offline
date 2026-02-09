@@ -13,7 +13,7 @@ use crate::components::{
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Damage {
-    pub amount: u32,
+    pub amount: i32,
     pub is_critical: bool,
     pub apply_hit_stun: bool,
 }

@@ -88,7 +88,7 @@ pub fn damage_system(
                 continue;
             }
 
-            health_points.hp = i32::max(health_points.hp - damage.amount as i32, 0);
+            health_points.hp = i32::max(health_points.hp - damage.amount, 0);
 
             if !matches!(damage_event, DamageEvent::Tagged { .. }) {
                 if let Some(attacker_entity_id) = attacker_entity_id {
@@ -120,7 +120,7 @@ pub fn damage_system(
                     .find(|source| source.entity == attacker_entity)
                 {
                     source.last_damage_time = time.last_update().unwrap();
-                    source.total_damage += damage.amount as usize;
+                    source.total_damage += damage.amount.max(0) as usize;
                 } else {
                     // If we have a full list of damage sources, remove the oldest
                     if damage_sources.damage_sources.len() == damage_sources.max_damage_sources {
@@ -147,7 +147,7 @@ pub fn damage_system(
 
                     damage_sources.damage_sources.push(DamageSource {
                         entity: attacker_entity,
-                        total_damage: damage.amount as usize,
+                        total_damage: damage.amount.max(0) as usize,
                         first_damage_time: time.last_update().unwrap(),
                         last_damage_time: time.last_update().unwrap(),
                     });

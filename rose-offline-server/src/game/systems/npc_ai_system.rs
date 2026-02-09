@@ -239,7 +239,7 @@ fn ai_condition_damage(
             operator,
             ai_parameters
                 .damage_received
-                .map_or(0, |damage| damage.amount as i32),
+                .map_or(0, |damage| damage.amount),
             value,
         ),
     }
@@ -1077,7 +1077,7 @@ fn ai_action_kill_self(
             attacker: ai_parameters.source.entity,
             defender: ai_parameters.source.entity,
             damage: Damage {
-                amount: ai_parameters.source.health_points.hp as u32 + 1,
+                amount: ai_parameters.source.health_points.hp + 1,
                 is_critical: false,
                 apply_hit_stun: false,
             },

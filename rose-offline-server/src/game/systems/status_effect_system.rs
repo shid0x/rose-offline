@@ -134,7 +134,7 @@ pub fn status_effect_system(
                                         attacker: entity,
                                         defender: entity,
                                         damage: Damage {
-                                            amount: data.apply_per_second_value as u32,
+                                            amount: data.apply_per_second_value,
                                             is_critical: false,
                                             apply_hit_stun: false,
                                         },

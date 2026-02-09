@@ -627,7 +627,7 @@ impl AbilityValueCalculator for AbilityValuesData {
             damage = f32::min(damage, defender.get_max_health() as f32 * 0.45);
         }
 
-        damage = f32::min(damage, 2047.0);
+        damage = damage.clamp(0.0, i32::MAX as f32);
 
         let apply_hit_stun = (damage * (rng.gen_range(1..=100) as f32 + 100.0)
             / (defender.get_avoid() as f32 + 40.0)
@@ -635,7 +635,7 @@ impl AbilityValueCalculator for AbilityValuesData {
             >= 10.0;
 
         Damage {
-            amount: damage as u32,
+            amount: damage as i32,
             is_critical: false,
             apply_hit_stun,
         }
@@ -1146,10 +1146,10 @@ fn calculate_attack_damage_physical(
             damage = f32::min(damage, defender.get_max_health() as f32 * 0.35);
         }
 
-        damage = f32::min(damage, 2047.0);
+        damage = damage.clamp(0.0, i32::MAX as f32);
 
         Damage {
-            amount: damage as u32,
+            amount: damage as i32,
             is_critical: true,
             apply_hit_stun,
         }
@@ -1185,10 +1185,10 @@ fn calculate_attack_damage_physical(
             damage = f32::min(damage, defender.get_max_health() as f32 * 0.25);
         }
 
-        damage = f32::min(damage, 2047.0);
+        damage = damage.clamp(0.0, i32::MAX as f32);
 
         Damage {
-            amount: damage as u32,
+            amount: damage as i32,
             is_critical: false,
             apply_hit_stun,
         }
@@ -1241,10 +1241,10 @@ fn calculate_attack_damage_magic(
             damage = f32::min(damage, defender.get_max_health() as f32 * 0.35);
         }
 
-        damage = f32::min(damage, 2047.0);
+        damage = damage.clamp(0.0, i32::MAX as f32);
 
         Damage {
-            amount: damage as u32,
+            amount: damage as i32,
             is_critical: true,
             apply_hit_stun,
         }
@@ -1282,10 +1282,10 @@ fn calculate_attack_damage_magic(
             damage = f32::min(damage, defender.get_max_health() as f32 * 0.25);
         }
 
-        damage = f32::min(damage, 2047.0);
+        damage = damage.clamp(0.0, i32::MAX as f32);
 
         Damage {
-            amount: damage as u32,
+            amount: damage as i32,
             is_critical: false,
             apply_hit_stun,
         }

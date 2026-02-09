@@ -15,6 +15,7 @@ use bevy::{
 };
 use clap::{Arg, PossibleValue};
 use lazy_static::lazy_static;
+use log::info;
 use rand::Rng;
 
 use rose_data::{
@@ -37,12 +38,12 @@ use crate::game::{
         CharacterBundle, ItemDropBundle, MonsterBundle,
     },
     components::{
-        AbilityValues, BasicStats, CharacterInfo, ClanMembership, ClientEntity, ClientEntitySector,
-        ClientEntityType, Command, Cooldowns, DamageSources, EquipmentItemDatabase, GameClient,
-        HealthPoints, Inventory, Level, ManaPoints, Money, MotionData, MoveMode, MoveSpeed,
-        NextCommand, PartyMembership, PassiveRecoveryTime, PersonalStore, Position, SkillList,
-        SkillPoints, SpawnOrigin, Stamina, StatPoints, StatusEffects, StatusEffectsRegen, Team,
-        UnionMembership, PERSONAL_STORE_ITEM_SLOTS,
+        AbilityValues, Account, BasicStats, CharacterInfo, ClanMembership, ClientEntity,
+        ClientEntitySector, ClientEntityType, Command, Cooldowns, DamageSources,
+        EquipmentItemDatabase, GameClient, HealthPoints, Inventory, Level, ManaPoints, Money,
+        MotionData, MoveMode, MoveSpeed, NextCommand, PartyMembership, PassiveRecoveryTime,
+        PersonalStore, Position, SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints,
+        StatusEffects, StatusEffectsRegen, Team, UnionMembership, PERSONAL_STORE_ITEM_SLOTS,
     },
     events::{ChatCommandEvent, ClanEvent, DamageEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
@@ -69,6 +70,7 @@ pub struct ChatCommandParams<'w, 's> {
 #[world_query(mutable)]
 pub struct ChatCommandUserQuery<'w> {
     entity: Entity,
+    account: &'w Account,
     ability_values: &'w AbilityValues,
     client_entity: &'w ClientEntity,
     client_entity_sector: &'w ClientEntitySector,
@@ -315,6 +317,21 @@ impl From<ParseFloatError> for ChatCommandError {
     }
 }
 
+fn parse_mon_vs_command(args: &[String]) -> Result<Option<(NpcId, NpcId)>, ChatCommandError> {
+    if args.len() != 4 {
+        return Ok(None);
+    }
+
+    if !args[0].eq_ignore_ascii_case("mon") || !args[2].eq_ignore_ascii_case("vs") {
+        return Ok(None);
+    }
+
+    let monster_id_a = NpcId::new(args[1].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
+    let monster_id_b = NpcId::new(args[3].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
+
+    Ok(Some((monster_id_a, monster_id_b)))
+}
+
 fn create_bot_entity(
     chat_command_params: &mut ChatCommandParams,
     name: String,
@@ -474,6 +491,84 @@ fn handle_chat_command(
     command_text: &str,
 ) -> Result<(), ChatCommandError> {
     let mut args = shellwords::split(command_text)?;
+
+    if let Some((monster_id_a, monster_id_b)) = parse_mon_vs_command(&args)? {
+        if chat_command_params.game_data.npcs.get_npc(monster_id_a).is_none() {
+            return Err(ChatCommandError::WithMessage(format!(
+                "Invalid monster id {}",
+                monster_id_a.get()
+            )));
+        }
+
+        if chat_command_params.game_data.npcs.get_npc(monster_id_b).is_none() {
+            return Err(ChatCommandError::WithMessage(format!(
+                "Invalid monster id {}",
+                monster_id_b.get()
+            )));
+        }
+
+        let center = chat_command_user.position.position;
+        let offset = 75.0;
+        let spawn_a = Vec3::new(center.x - offset, center.y, center.z);
+        let spawn_b = Vec3::new(center.x + offset, center.y, center.z);
+
+        let team_a = Team::with_unique_id(rand::thread_rng().gen::<u32>());
+        let team_b = Team::with_unique_id(rand::thread_rng().gen::<u32>());
+
+        let monster_a = MonsterBundle::spawn(
+            &mut chat_command_params.commands,
+            &mut chat_command_params.client_entity_list,
+            &chat_command_params.game_data,
+            monster_id_a,
+            chat_command_user.position.zone_id,
+            SpawnOrigin::Summoned(chat_command_user.entity, spawn_a),
+            25,
+            team_a,
+            None,
+            None,
+        )
+        .ok_or_else(|| {
+            ChatCommandError::WithMessage(format!("Failed to spawn monster {}", monster_id_a.get()))
+        })?;
+
+        let monster_b = MonsterBundle::spawn(
+            &mut chat_command_params.commands,
+            &mut chat_command_params.client_entity_list,
+            &chat_command_params.game_data,
+            monster_id_b,
+            chat_command_user.position.zone_id,
+            SpawnOrigin::Summoned(chat_command_user.entity, spawn_b),
+            25,
+            team_b,
+            None,
+            None,
+        )
+        .ok_or_else(|| {
+            ChatCommandError::WithMessage(format!("Failed to spawn monster {}", monster_id_b.get()))
+        })?;
+
+        chat_command_params
+            .commands
+            .entity(monster_a)
+            .insert(NextCommand::with_attack(monster_b));
+        chat_command_params
+            .commands
+            .entity(monster_b)
+            .insert(NextCommand::with_attack(monster_a));
+
+        info!(
+            "GM /mon {} vs {} by account={} character={} spawned entities A={:?}, B={:?}",
+            monster_id_a.get(),
+            monster_id_b.get(),
+            chat_command_user.account.name,
+            chat_command_user.character_info.name,
+            monster_a,
+            monster_b
+        );
+
+        return Ok(());
+    }
+
     args.insert(0, String::new()); // Clap expects arg[0] to be like executable name
     let command_matches = CHAT_COMMANDS.clone().try_get_matches_from(args)?;
 
@@ -955,7 +1050,7 @@ fn handle_chat_command(
             }
         }
         ("damage", arg_matches) => {
-            let amount = arg_matches.value_of("amount").unwrap().parse::<u32>()?;
+            let amount = arg_matches.value_of("amount").unwrap().parse::<i32>()?;
             let distance = arg_matches.value_of("distance").unwrap().parse::<f32>()?;
             let damage = Damage {
                 amount,
