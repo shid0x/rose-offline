@@ -1,8 +1,8 @@
 #Add ons on this version : 
 
--2047 damage limit was removed
--Cliking on the exit button on the UI will exit the game correctly 
--You can now learn upgrade your skill learning ( the button for leveling up skill is hardcodded due to some DDS padding )
+-2047 damage limit was removed<br>
+-Cliking on the exit button on the UI will exit the game correctly<br> 
+-You can now learn upgrade your skill learning ( the button for leveling up skill is hardcodded due to some DDS padding )<br>
 
 
 
