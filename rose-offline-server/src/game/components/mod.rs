@@ -71,7 +71,7 @@ pub use party::{Party, PartyMember};
 pub use party_membership::PartyMembership;
 pub use party_owner::PartyOwner;
 pub use passive_recovery_time::PassiveRecoveryTime;
-pub use personal_store::{PersonalStore, PERSONAL_STORE_ITEM_SLOTS};
+pub use personal_store::{PersonalStore, PersonalStoreSellItem, PERSONAL_STORE_ITEM_SLOTS};
 pub use position::Position;
 pub use server_info::ServerInfo;
 pub use spawn_origin::SpawnOrigin;

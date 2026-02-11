@@ -25,6 +25,7 @@ use rose_data::{
 use rose_game_common::{
     components::{BasicStatType, ClanLevel, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot},
     data::Damage,
+    messages::server::PersonalStoreTransactionStatus,
 };
 
 use crate::game::{
@@ -40,10 +41,11 @@ use crate::game::{
     components::{
         AbilityValues, Account, BasicStats, CharacterInfo, ClanMembership, ClientEntity,
         ClientEntitySector, ClientEntityType, Command, Cooldowns, DamageSources,
-        EquipmentItemDatabase, GameClient, HealthPoints, Inventory, Level, ManaPoints, Money,
-        MotionData, MoveMode, MoveSpeed, NextCommand, PartyMembership, PassiveRecoveryTime,
-        PersonalStore, Position, SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints,
-        StatusEffects, StatusEffectsRegen, Team, UnionMembership, PERSONAL_STORE_ITEM_SLOTS,
+        EquipmentItemDatabase, GameClient, HealthPoints, Inventory, InventoryPageType, Level,
+        ManaPoints, Money, MotionData, MoveMode, MoveSpeed, NextCommand, PartyMembership,
+        PassiveRecoveryTime, PersonalStore, Position, SkillList, SkillPoints, SpawnOrigin, Stamina,
+        StatPoints, StatusEffects, StatusEffectsRegen, Team, UnionMembership,
+        PERSONAL_STORE_ITEM_SLOTS,
     },
     events::{ChatCommandEvent, ClanEvent, DamageEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
@@ -74,6 +76,7 @@ pub struct ChatCommandUserQuery<'w> {
     ability_values: &'w AbilityValues,
     client_entity: &'w ClientEntity,
     client_entity_sector: &'w ClientEntitySector,
+    command: &'w mut Command,
     game_client: &'w GameClient,
     level: &'w mut Level,
     position: &'w Position,
@@ -83,6 +86,7 @@ pub struct ChatCommandUserQuery<'w> {
     health_points: &'w mut HealthPoints,
     inventory: &'w mut Inventory,
     mana_points: &'w mut ManaPoints,
+    personal_store: Option<&'w mut PersonalStore>,
     skill_list: &'w mut SkillList,
     skill_points: &'w mut SkillPoints,
     stamina: &'w mut Stamina,
@@ -148,6 +152,17 @@ lazy_static! {
             )
             .subcommand(clap::Command::new("snowball_fight").arg(Arg::new("n").required(true)))
             .subcommand(clap::Command::new("shop").arg(Arg::new("item_type").required(true)))
+            .subcommand(
+                clap::Command::new("pshop_open")
+                    .arg(Arg::new("title").required(true))
+                    .arg(Arg::new("listings").required(true)),
+            )
+            .subcommand(clap::Command::new("pshop_close"))
+            .subcommand(
+                clap::Command::new("pshop_test_buy")
+                    .arg(Arg::new("slot").required(true))
+                    .arg(Arg::new("quantity").required(true)),
+            )
             .subcommand(
                 clap::Command::new("add")
                     .arg(Arg::new("ability_type").required(true))
@@ -326,10 +341,66 @@ fn parse_mon_vs_command(args: &[String]) -> Result<Option<(NpcId, NpcId)>, ChatC
         return Ok(None);
     }
 
-    let monster_id_a = NpcId::new(args[1].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
-    let monster_id_b = NpcId::new(args[3].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
+    let monster_id_a =
+        NpcId::new(args[1].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
+    let monster_id_b =
+        NpcId::new(args[3].parse::<u16>()?).ok_or(ChatCommandError::InvalidArguments)?;
 
     Ok(Some((monster_id_a, monster_id_b)))
+}
+
+struct ParsedShopListing {
+    item_slot: rose_game_common::components::ItemSlot,
+    quantity: u32,
+    price: Money,
+}
+
+fn parse_shop_page_code(page_code: &str) -> Option<InventoryPageType> {
+    match page_code.to_ascii_uppercase().as_str() {
+        "E" => Some(InventoryPageType::Equipment),
+        "C" => Some(InventoryPageType::Consumables),
+        "M" => Some(InventoryPageType::Materials),
+        "V" => Some(InventoryPageType::Vehicles),
+        _ => None,
+    }
+}
+
+fn parse_shop_listings(listings: &str) -> Result<Vec<ParsedShopListing>, ChatCommandError> {
+    let mut result = Vec::new();
+    if listings.trim().is_empty() {
+        return Ok(result);
+    }
+
+    for token in listings.split(';') {
+        let mut parts = token.split(':');
+        let page_code = parts.next().ok_or(ChatCommandError::InvalidArguments)?;
+        let slot_index = parts
+            .next()
+            .ok_or(ChatCommandError::InvalidArguments)?
+            .parse::<usize>()?;
+        let quantity = parts
+            .next()
+            .ok_or(ChatCommandError::InvalidArguments)?
+            .parse::<u32>()?;
+        let price = parts
+            .next()
+            .ok_or(ChatCommandError::InvalidArguments)?
+            .parse::<i64>()?;
+
+        if parts.next().is_some() {
+            return Err(ChatCommandError::InvalidArguments);
+        }
+
+        let page_type =
+            parse_shop_page_code(page_code).ok_or(ChatCommandError::InvalidArguments)?;
+        result.push(ParsedShopListing {
+            item_slot: rose_game_common::components::ItemSlot::Inventory(page_type, slot_index),
+            quantity,
+            price: Money(price),
+        });
+    }
+
+    Ok(result)
 }
 
 fn create_bot_entity(
@@ -493,14 +564,24 @@ fn handle_chat_command(
     let mut args = shellwords::split(command_text)?;
 
     if let Some((monster_id_a, monster_id_b)) = parse_mon_vs_command(&args)? {
-        if chat_command_params.game_data.npcs.get_npc(monster_id_a).is_none() {
+        if chat_command_params
+            .game_data
+            .npcs
+            .get_npc(monster_id_a)
+            .is_none()
+        {
             return Err(ChatCommandError::WithMessage(format!(
                 "Invalid monster id {}",
                 monster_id_a.get()
             )));
         }
 
-        if chat_command_params.game_data.npcs.get_npc(monster_id_b).is_none() {
+        if chat_command_params
+            .game_data
+            .npcs
+            .get_npc(monster_id_b)
+            .is_none()
+        {
             return Err(ChatCommandError::WithMessage(format!(
                 "Invalid monster id {}",
                 monster_id_b.get()
@@ -864,7 +945,11 @@ fn handle_chat_command(
                         }
                     }) {
                         if let Ok((slot, _)) = inventory.try_add_item(item) {
-                            store.add_sell_item(slot, Money(1)).ok();
+                            let quantity = inventory
+                                .get_item(slot)
+                                .map(|item| item.get_quantity())
+                                .unwrap_or(1);
+                            store.add_sell_item(slot, Money(1), quantity).ok();
                         }
                     }
                 }
@@ -878,6 +963,240 @@ fn handle_chat_command(
                     .insert(inventory)
                     .insert(NextCommand::with_personal_store());
             }
+        }
+        ("pshop_open", arg_matches) => {
+            let title = arg_matches.value_of("title").unwrap().trim();
+            let listings = parse_shop_listings(arg_matches.value_of("listings").unwrap())?;
+
+            if title.is_empty() {
+                return Err(ChatCommandError::WithMessage(String::from(
+                    "Shop title cannot be empty",
+                )));
+            }
+
+            if listings.is_empty() {
+                return Err(ChatCommandError::WithMessage(String::from(
+                    "Shop must contain at least one item",
+                )));
+            }
+
+            if listings.len() > PERSONAL_STORE_ITEM_SLOTS {
+                return Err(ChatCommandError::WithMessage(format!(
+                    "Shop can have at most {} listings",
+                    PERSONAL_STORE_ITEM_SLOTS
+                )));
+            }
+
+            let mut used_slots = HashSet::default();
+            let mut personal_store = PersonalStore::new(title.to_string(), 0);
+            for listing in listings.into_iter() {
+                if listing.quantity == 0 {
+                    return Err(ChatCommandError::WithMessage(String::from(
+                        "Listing quantity must be greater than 0",
+                    )));
+                }
+
+                if listing.price.0 < 0 {
+                    return Err(ChatCommandError::WithMessage(String::from(
+                        "Listing price must be non-negative",
+                    )));
+                }
+
+                if !used_slots.insert(listing.item_slot) {
+                    return Err(ChatCommandError::WithMessage(String::from(
+                        "Duplicate inventory slot in shop listings",
+                    )));
+                }
+
+                let Some(item) = chat_command_user.inventory.get_item(listing.item_slot) else {
+                    return Err(ChatCommandError::WithMessage(String::from(
+                        "Shop listing references an empty inventory slot",
+                    )));
+                };
+
+                if listing.quantity > item.get_quantity() {
+                    return Err(ChatCommandError::WithMessage(format!(
+                        "Listing quantity {} exceeds owned quantity {}",
+                        listing.quantity,
+                        item.get_quantity()
+                    )));
+                }
+
+                if !item.is_stackable_item() && listing.quantity != 1 {
+                    return Err(ChatCommandError::WithMessage(String::from(
+                        "Equipment listings must use quantity 1",
+                    )));
+                }
+
+                personal_store
+                    .add_sell_item(listing.item_slot, listing.price, listing.quantity)
+                    .map_err(|_| {
+                        ChatCommandError::WithMessage(String::from("Personal store is full"))
+                    })?;
+            }
+
+            info!(
+                "player-shop: open_setup account={} title='{}' slots={}",
+                chat_command_user.account.name,
+                title,
+                personal_store
+                    .sell_items
+                    .iter()
+                    .filter(|slot| slot.is_some())
+                    .count()
+            );
+
+            chat_command_params
+                .commands
+                .entity(chat_command_user.entity)
+                .insert(personal_store)
+                .insert(NextCommand::with_personal_store());
+        }
+        ("pshop_close", _) => {
+            chat_command_params
+                .commands
+                .entity(chat_command_user.entity)
+                .remove::<PersonalStore>()
+                .insert(NextCommand::with_stop(true));
+            *chat_command_user.command = Command::with_stop();
+
+            // Send directly to the owner to avoid any visibility/filtering edge cases.
+            chat_command_user
+                .game_client
+                .server_message_tx
+                .send(ServerMessage::ClosePersonalStore {
+                    entity_id: chat_command_user.client_entity.id,
+                })
+                .ok();
+
+            chat_command_params.server_messages.send_zone_message(
+                chat_command_user.position.zone_id,
+                ServerMessage::ClosePersonalStore {
+                    entity_id: chat_command_user.client_entity.id,
+                },
+            );
+
+            info!(
+                "player-shop: close account={}",
+                chat_command_user.account.name
+            );
+        }
+        ("pshop_test_buy", arg_matches) => {
+            let slot_index = arg_matches.value_of("slot").unwrap().parse::<usize>()?;
+            let quantity = arg_matches.value_of("quantity").unwrap().parse::<u32>()?;
+            if quantity == 0 {
+                return Err(ChatCommandError::WithMessage(String::from(
+                    "Quantity must be greater than 0",
+                )));
+            }
+
+            let personal_store = chat_command_user
+                .personal_store
+                .as_mut()
+                .ok_or_else(|| ChatCommandError::WithMessage(String::from("Shop is not open")))?;
+            let Some((store_item_slot, store_unit_price, store_quantity)) = personal_store
+                .sell_items
+                .get(slot_index)
+                .and_then(|slot| slot.as_ref())
+                .map(|slot| (slot.item_slot, slot.price, slot.quantity))
+            else {
+                return Err(ChatCommandError::WithMessage(String::from(
+                    "Invalid shop slot index",
+                )));
+            };
+
+            if quantity > store_quantity {
+                return Err(ChatCommandError::WithMessage(format!(
+                    "Requested quantity {} exceeds slot quantity {}",
+                    quantity, store_quantity
+                )));
+            }
+
+            let Some(inventory_item) = chat_command_user.inventory.get_item(store_item_slot) else {
+                return Err(ChatCommandError::WithMessage(String::from(
+                    "Shop inventory slot is empty",
+                )));
+            };
+
+            if quantity > inventory_item.get_quantity() {
+                return Err(ChatCommandError::WithMessage(format!(
+                    "Requested quantity {} exceeds inventory quantity {}",
+                    quantity,
+                    inventory_item.get_quantity()
+                )));
+            }
+
+            let item = chat_command_user
+                .inventory
+                .try_take_quantity(store_item_slot, quantity)
+                .ok_or_else(|| {
+                    ChatCommandError::WithMessage(String::from("Failed to take item"))
+                })?;
+            let sale_price = Money(store_unit_price.0 * item.get_quantity() as i64);
+            chat_command_user.inventory.try_add_money(sale_price).ok();
+
+            if let Some(store_slot) = personal_store
+                .sell_items
+                .get_mut(slot_index)
+                .and_then(|slot| slot.as_mut())
+            {
+                store_slot.quantity = store_slot.quantity.saturating_sub(item.get_quantity());
+                if store_slot.quantity == 0
+                    || chat_command_user
+                        .inventory
+                        .get_item(store_slot.item_slot)
+                        .is_none()
+                {
+                    personal_store.sell_items[slot_index] = None;
+                }
+            }
+
+            let updated_store_item =
+                personal_store.sell_items[slot_index]
+                    .as_ref()
+                    .and_then(|slot| {
+                        let mut item = chat_command_user
+                            .inventory
+                            .get_item(slot.item_slot)?
+                            .clone();
+                        if let Item::Stackable(stackable) = &mut item {
+                            stackable.quantity = stackable.quantity.min(slot.quantity);
+                        }
+                        Some(item)
+                    });
+
+            chat_command_user
+                .game_client
+                .server_message_tx
+                .send(ServerMessage::PersonalStoreTransaction {
+                    status: PersonalStoreTransactionStatus::BoughtFromStore,
+                    store_entity_id: chat_command_user.client_entity.id,
+                    update_store: vec![(slot_index, updated_store_item)],
+                })
+                .ok();
+
+            chat_command_user
+                .game_client
+                .server_message_tx
+                .send(ServerMessage::PersonalStoreTransactionUpdateInventory {
+                    money: chat_command_user.inventory.money,
+                    items: vec![(
+                        store_item_slot,
+                        chat_command_user
+                            .inventory
+                            .get_item(store_item_slot)
+                            .cloned(),
+                    )],
+                })
+                .ok();
+
+            info!(
+                "player-shop: debug_buy account={} slot={} qty={} money={}",
+                chat_command_user.account.name,
+                slot_index,
+                item.get_quantity(),
+                sale_price.0
+            );
         }
         ("add", arg_matches) => {
             let ability_type_str = arg_matches.value_of("ability_type").unwrap();

@@ -26,8 +26,8 @@ use crate::game::{
         Command, CommandData, Cooldowns, DamageSources, Dead, DrivingTime, DroppedItem, Equipment,
         EquipmentItemDatabase, ExperiencePoints, GameClient, HealthPoints, Hotbar, Inventory,
         ItemSlot, Level, ManaPoints, Money, MotionData, MoveMode, MoveSpeed, NextCommand, Party,
-        PartyMember, PartyMembership, PassiveRecoveryTime, Position, QuestState, SkillList,
-        SkillPoints, StatPoints, StatusEffects, StatusEffectsRegen, Team, WorldClient,
+        PartyMember, PartyMembership, PassiveRecoveryTime, PersonalStore, Position, QuestState,
+        SkillList, SkillPoints, StatPoints, StatusEffects, StatusEffectsRegen, Team, WorldClient,
     },
     events::{
         BankEvent, ChatCommandEvent, ClanEvent, EquipmentEvent, ItemLifeEvent, NpcStoreEvent,
@@ -437,6 +437,7 @@ pub struct GameClientQuery<'w> {
     position: &'w Position,
     ability_values: &'w AbilityValues,
     command: &'w Command,
+    personal_store: Option<&'w PersonalStore>,
     dead: Option<&'w Dead>,
     level: &'w Level,
     move_speed: &'w MoveSpeed,
@@ -504,6 +505,10 @@ pub fn game_server_main_system(
                     y,
                     z,
                 } => {
+                    if game_client.personal_store.is_some() {
+                        continue;
+                    }
+
                     let mut move_target_entity = None;
                     if let Some(target_entity_id) = target_entity_id {
                         if let Some((target_entity, _, _)) = client_entity_list
@@ -1055,6 +1060,10 @@ pub fn game_server_main_system(
                     });
                 }
                 ClientMessage::MoveCollision { position } => {
+                    if game_client.personal_store.is_some() {
+                        continue;
+                    }
+
                     // TODO: Sanity check position
                     entity_commands
                         .insert(NextCommand::with_move(position, None, None))

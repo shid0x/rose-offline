@@ -6,12 +6,19 @@ use crate::game::components::{ItemSlot, Money};
 
 pub const PERSONAL_STORE_ITEM_SLOTS: usize = 30;
 
+#[derive(Clone)]
+pub struct PersonalStoreSellItem {
+    pub item_slot: ItemSlot,
+    pub price: Money,
+    pub quantity: u32,
+}
+
 #[derive(Clone, Component)]
 pub struct PersonalStore {
     pub title: String,
     pub skin: i32,
     pub buy_items: [Option<(Item, Money)>; PERSONAL_STORE_ITEM_SLOTS],
-    pub sell_items: [Option<(ItemSlot, Money)>; PERSONAL_STORE_ITEM_SLOTS],
+    pub sell_items: [Option<PersonalStoreSellItem>; PERSONAL_STORE_ITEM_SLOTS],
 }
 
 pub enum PersonalStoreError {
@@ -32,10 +39,15 @@ impl PersonalStore {
         &mut self,
         item: ItemSlot,
         price: Money,
+        quantity: u32,
     ) -> Result<(), PersonalStoreError> {
         for slot in self.sell_items.iter_mut() {
             if slot.is_none() {
-                *slot = Some((item, price));
+                *slot = Some(PersonalStoreSellItem {
+                    item_slot: item,
+                    price,
+                    quantity,
+                });
                 return Ok(());
             }
         }

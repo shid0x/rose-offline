@@ -13,7 +13,7 @@ use rose_game_common::{
 };
 
 use crate::game::{
-    components::{ClientEntity, GameClient, Inventory, PersonalStore},
+    components::{ClientEntity, GameClient, Inventory, PersonalStore, PersonalStoreSellItem},
     events::PersonalStoreEvent,
     messages::server::ServerMessage,
 };
@@ -41,9 +41,9 @@ fn personal_store_list_items(
     }
 
     for (store_slot, slot) in store.sell_items.iter().enumerate() {
-        if let Some((item_slot, price)) = slot {
-            if let Some(item) = seller.inventory.get_item(*item_slot) {
-                sell_items.push((store_slot as u8, item.clone(), *price));
+        if let Some(sell_slot) = slot {
+            if let Some(item) = get_personal_store_list_item(&seller.inventory, sell_slot) {
+                sell_items.push((store_slot as u8, item, sell_slot.price));
             }
         }
     }
@@ -66,6 +66,17 @@ enum BuyError {
     InventoryFull,
 }
 
+fn get_personal_store_list_item(
+    inventory: &Inventory,
+    sell_slot: &PersonalStoreSellItem,
+) -> Option<Item> {
+    let mut item = inventory.get_item(sell_slot.item_slot).cloned()?;
+    if let Item::Stackable(stackable) = &mut item {
+        stackable.quantity = stackable.quantity.min(sell_slot.quantity);
+    }
+    Some(item)
+}
+
 fn personal_store_buy_item(
     store: &mut Mut<PersonalStore>,
     seller: &mut PersonalStoreEntityQueryItem,
@@ -74,12 +85,13 @@ fn personal_store_buy_item(
     buy_item: &Item,
 ) -> Result<(ItemSlot, ItemSlot), BuyError> {
     // Try get the item from the personal store
-    let (store_item_slot, item_price) = store
+    let sell_slot = store
         .sell_items
         .get(store_slot_index)
         .and_then(|x| x.as_ref())
         .ok_or(BuyError::InvalidStoreSlotIndex)
         .cloned()?;
+    let store_item_slot = sell_slot.item_slot;
 
     let store_inventory_slot = seller
         .inventory
@@ -89,7 +101,11 @@ fn personal_store_buy_item(
         return Err(BuyError::ItemSoldOut);
     }
 
-    let item_price = Money(item_price.0 * buy_item.get_quantity() as i64);
+    if buy_item.get_quantity() == 0 || buy_item.get_quantity() > sell_slot.quantity {
+        return Err(BuyError::ItemSoldOut);
+    }
+
+    let item_price = Money(sell_slot.price.0 * buy_item.get_quantity() as i64);
     if buyer.inventory.money < item_price {
         return Err(BuyError::NotEnoughMoney);
     }
@@ -105,6 +121,20 @@ fn personal_store_buy_item(
     match buyer.inventory.try_add_item(transaction_item) {
         Ok((buyer_item_slot, _)) => {
             // Success, give money to seller
+            let mut clear_store_slot = false;
+            if let Some(store_slot) = store.sell_items.get_mut(store_slot_index) {
+                if let Some(store_slot) = store_slot.as_mut() {
+                    store_slot.quantity =
+                        store_slot.quantity.saturating_sub(buy_item.get_quantity());
+                    if store_slot.quantity == 0 {
+                        clear_store_slot = true;
+                    }
+                }
+            }
+            if clear_store_slot {
+                *store.sell_items.get_mut(store_slot_index).unwrap() = None;
+            }
+
             if store_inventory_slot.is_none() {
                 *store.sell_items.get_mut(store_slot_index).unwrap() = None;
             }
@@ -164,6 +194,14 @@ pub fn personal_store_system(
                             buy_item,
                         ) {
                             Ok((buyer_item_slot, seller_item_slot)) => {
+                                let updated_store_item = store
+                                    .sell_items
+                                    .get(store_slot_index)
+                                    .and_then(|slot| slot.as_ref())
+                                    .and_then(|slot| {
+                                        get_personal_store_list_item(&seller.inventory, slot)
+                                    });
+
                                 if let Some(seller_game_client) = seller.game_client {
                                     seller_game_client
                                         .server_message_tx
@@ -172,10 +210,7 @@ pub fn personal_store_system(
                                             store_entity_id: seller.client_entity.id,
                                             update_store: vec![(
                                                 store_slot_index,
-                                                seller
-                                                    .inventory
-                                                    .get_item(seller_item_slot)
-                                                    .cloned(),
+                                                updated_store_item.clone(),
                                             )],
                                         })
                                         .ok();
@@ -202,10 +237,7 @@ pub fn personal_store_system(
                                             store_entity_id: seller.client_entity.id,
                                             update_store: vec![(
                                                 store_slot_index,
-                                                seller
-                                                    .inventory
-                                                    .get_item(seller_item_slot)
-                                                    .cloned(),
+                                                updated_store_item,
                                             )],
                                         })
                                         .ok();
