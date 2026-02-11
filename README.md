@@ -1,11 +1,11 @@
 #Add ons on this version : 
 
--2047 damage limit was removed
--Cliking on the exit button on the UI will exit the game correctly 
--You can now learn upgrade your skill learning ( the button for leveling up skill is hardcodded due to some DDS padding )
--/mon ID vs MON
--Pressing F9 in game now brings up and item browser so you can get them easily 
--Shop system operational 
+-2047 damage limit was removed<br>
+-Cliking on the exit button on the UI will exit the game correctly<br> 
+-You can now learn upgrade your skill learning ( the button for leveling up skill is hardcodded due to some DDS padding )<br>
+-/mon ID vs MON<br>
+-Pressing F9 in game now brings up and item browser so you can get them easily<br> 
+-Shop system operational<br>
 
 
 
