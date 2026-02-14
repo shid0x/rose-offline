@@ -1,22 +1,50 @@
-#Add ons on this version : 
+Changes compared to original exjam version :<br>
+<br>
+Content : <br>
+-Skill leveling system implemented<br> 
+-Shop system implemented <br>
 
--2047 damage limit was removed<br>
--Cliking on the exit button on the UI will exit the game correctly<br> 
--You can now learn upgrade your skill learning ( the button for leveling up skill is hardcodded due to some DDS padding )<br>
--/mon ID vs MON<br>
--Pressing F9 in game now brings up and item browser so you can get them easily<br> 
--Shop system operational<br>
+Extra features : <br>
+-2047 damage limit was removed <br>
+-/mon ID vs MON <br>
+-Pressing F9 in game now brings up and item browser so you can get them easily <br> 
+
+Bug fixes :  <br>
+-Cliking on the exit button on the UI will exit the game correctly  <br>
+-Drap and drop buying operational  <br>
+-Player getting out of combat when using a skill and being out of MPs  <br>
+-Player missing after using a skill  <br>
+-name plate not following the player height when in a cart or a castle gear <br>
 
 
 
-# rose-offline
 
-An open source server for ROSE Online, compatible with the official 129_129en irose client or [rose-offline-client](https://github.com/exjam/rose-offline-client).
+# rose-offline-client
+An open source client for ROSE Online, compatible with the official 129_129en irose server or [rose-offline](https://github.com/exjam/rose-offline/).
 
-# Running the server
-Run rose-offline-server from your installed official client directory (the folder containing data.idx), or you can use the `--data-idx` or `--data-path` arguments as described below.
+# Running
+Run rose-offline-client from your installed official client directory (the folder containing data.idx), or you can use the `--data-idx` or `--data-path` arguments as described below.
 
 ## Optional arguments:
 - `--data-idx=<path/to/data.idx>` Path to irose 129en data.idx
-- `--data-path=<path/to/data>` Path to extracted irose 129en game files
-- `--ip=<ip>` IP to listen for client connections, defaults to 127.0.0.1
+- `--data-aruavfs-idx=<path/to/data.idx>` Path to aruarose data.idx
+- `--data-titanvfs-idx=<path/to/data.idx>` Path to titanrose data.idx
+- `--ip` Server IP for login server (defaults to 127.0.0.1)
+- `--port` Server port for login server (defaults to 29000)
+- `--model-viewer` Start the client in model viewer mode
+- `--zone=<N>` Start the client in zone viewer mode in the given zone
+
+## Auto login arguments:
+- `--auto-login` Automatic login.
+- `--username=<username>` Username for auto login
+- `--password=<password>` Password for auto login
+- `--server-id=<N>` Server ID for auto login (defaults to 0)
+- `--channel-id=<N>` Channel ID for auto login (defaults to 0)
+- `--character-name=<name>` Character name for auto login (optional, auto login can be username/password only)
+
+# Screenshots
+
+<img alt="Fighting Jellybeans"  src="https://user-images.githubusercontent.com/1302758/218569716-d7c131e0-bc5b-4474-b060-745755202c95.jpg">
+
+<img alt="Castlegear" src="https://user-images.githubusercontent.com/1302758/218569729-11887740-2205-4730-a420-c21b2e8a83f2.jpg">
+

@@ -761,14 +761,16 @@ pub fn command_system(
                     &query_skill_caster,
                     &query_skill_target,
                 ) {
-                    // Cannot use skill, cancel command.
-                    command_stop(
-                        &mut command_entity.command,
-                        command_entity.client_entity,
-                        command_entity.position,
-                        Some(&mut server_messages),
-                    );
-                    *command_entity.next_command = NextCommand::default();
+                    // Cannot use skill (e.g. insufficient MP). Discard the cast request but
+                    // preserve current combat intent to avoid breaking auto-attack state.
+                    if let Some(target_entity) = command_entity.command.target_entity() {
+                        *command_entity.next_command =
+                            NextCommand::with_command_skip_server_message(CommandData::Attack {
+                                target: target_entity,
+                            });
+                    } else {
+                        *command_entity.next_command = NextCommand::default();
+                    }
                     continue;
                 }
 
@@ -912,7 +914,6 @@ pub fn command_system(
                     casting_duration,
                     action_duration,
                 );
-                *command_entity.next_command = NextCommand::default();
             }
             CommandData::PersonalStore => {
                 let personal_store = command_entity.personal_store.unwrap();
