@@ -23,7 +23,7 @@ use rose_data::{
     StackableItem, ZoneId,
 };
 use rose_game_common::{
-    components::{BasicStatType, ClanLevel, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot},
+    components::{BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot},
     data::Damage,
     messages::server::PersonalStoreTransactionStatus,
 };
@@ -189,6 +189,14 @@ lazy_static! {
             .subcommand(
                 clap::Command::new("clan")
                     .subcommand(
+                        clap::Command::new("create")
+                            .arg(Arg::new("name").required(true)),
+                    )
+                    .subcommand(
+                        clap::Command::new("invite")
+                            .arg(Arg::new("name").required(true)),
+                    )
+                    .subcommand(
                         clap::Command::new("level")
                             .arg(
                                 Arg::new("cmd")
@@ -235,6 +243,9 @@ lazy_static! {
                                     .required(true),
                             )
                             .arg(Arg::new("value").required(true)),
+                    )
+                    .subcommand(
+                        clap::Command::new("leave"),
                     ),
             )
             .subcommand(
@@ -1580,7 +1591,25 @@ fn handle_chat_command(
             }
         }
         ("clan", arg_matches) => {
-            if let Some(sub_matches) = arg_matches.subcommand_matches("level") {
+            if let Some(sub_matches) = arg_matches.subcommand_matches("create") {
+                let name = sub_matches.value_of("name").unwrap().to_string();
+                chat_command_params.clan_events.send(ClanEvent::Create {
+                    creator: chat_command_user.entity,
+                    name,
+                    description: String::new(),
+                    mark: ClanMark::Premade {
+                        background: std::num::NonZeroU16::new(1).unwrap(),
+                        foreground: std::num::NonZeroU16::new(1).unwrap(),
+                    },
+                    skip_requirements: true,
+                });
+            } else if let Some(sub_matches) = arg_matches.subcommand_matches("invite") {
+                let name = sub_matches.value_of("name").unwrap().to_string();
+                chat_command_params.clan_events.send(ClanEvent::Invite {
+                    inviter_entity: chat_command_user.entity,
+                    name,
+                });
+            } else if let Some(sub_matches) = arg_matches.subcommand_matches("level") {
                 let cmd = sub_matches.value_of("cmd").unwrap();
                 let value = sub_matches.value_of("value").unwrap().parse::<i32>()?;
 
@@ -1669,6 +1698,10 @@ fn handle_chat_command(
                         _ => return Err(ChatCommandError::InvalidArguments),
                     }
                 }
+            } else if arg_matches.subcommand_matches("leave").is_some() {
+                chat_command_params.clan_events.send(ClanEvent::Leave {
+                    leaver_entity: chat_command_user.entity,
+                });
             }
         }
         ("rate", arg_matches) => {

@@ -1240,6 +1240,59 @@ pub fn game_server_main_system(
                         name,
                         description,
                         mark,
+                        skip_requirements: false,
+                    });
+                }
+                ClientMessage::ClanInvite { name } => {
+                    events.clan_events.send(ClanEvent::Invite {
+                        inviter_entity: game_client.entity,
+                        name,
+                    });
+                }
+                ClientMessage::ClanSetDescription { description } => {
+                    events.clan_events.send(ClanEvent::SetDescription {
+                        updater_entity: game_client.entity,
+                        description,
+                    });
+                }
+                ClientMessage::ClanAcceptInvite { inviter_name } => {
+                    events.clan_events.send(ClanEvent::AcceptInvite {
+                        invited_entity: game_client.entity,
+                        inviter_name,
+                    });
+                }
+                ClientMessage::ClanRejectInvite { inviter_name } => {
+                    events.clan_events.send(ClanEvent::RejectInvite {
+                        invited_entity: game_client.entity,
+                        inviter_name,
+                    });
+                }
+                ClientMessage::ClanKick { name } => {
+                    events.clan_events.send(ClanEvent::Kick {
+                        kicker_entity: game_client.entity,
+                        name,
+                    });
+                }
+                ClientMessage::ClanPromote { name } => {
+                    events.clan_events.send(ClanEvent::Promote {
+                        changer_entity: game_client.entity,
+                        name,
+                    });
+                }
+                ClientMessage::ClanDemote { name } => {
+                    events.clan_events.send(ClanEvent::Demote {
+                        changer_entity: game_client.entity,
+                        name,
+                    });
+                }
+                ClientMessage::ClanLeave => {
+                    events.clan_events.send(ClanEvent::Leave {
+                        leaver_entity: game_client.entity,
+                    });
+                }
+                ClientMessage::ClanDisband => {
+                    events.clan_events.send(ClanEvent::Disband {
+                        entity: game_client.entity,
                     });
                 }
                 _ => warn!("[GS] Received unimplemented client message {:?}", message),

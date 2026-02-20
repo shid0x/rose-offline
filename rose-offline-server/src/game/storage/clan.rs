@@ -95,6 +95,19 @@ impl ClanStorage {
         Ok(clan_list)
     }
 
+    pub fn delete(name: &str) -> Result<(), anyhow::Error> {
+        let path = get_clan_path(name);
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| {
+                format!(
+                    "Failed to delete clan storage file {}",
+                    path.to_string_lossy()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<(), anyhow::Error> {
         self.save_clan_impl(true)
     }

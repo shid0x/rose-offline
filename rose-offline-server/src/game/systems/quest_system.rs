@@ -33,10 +33,10 @@ use crate::game::{
     },
     components::{
         AbilityValues, ActiveQuest, BasicStats, CharacterInfo, Clan, ClanMembership, ClientEntity,
-        ClientEntitySector, Equipment, ExperiencePoints, GameClient, HealthPoints, Inventory,
-        Level, ManaPoints, Money, MoveSpeed, Npc, ObjectVariables, Party, PartyMembership,
-        Position, QuestState, SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints, Team,
-        UnionMembership,
+        ClientEntitySector, ClientEntityType, Equipment, ExperiencePoints, GameClient,
+        HealthPoints, Inventory, Level, ManaPoints, Money, MoveSpeed, Npc, ObjectVariables,
+        Party, PartyMembership, Position, QuestState, SkillList, SkillPoints, SpawnOrigin,
+        Stamina, StatPoints, Team, UnionMembership,
     },
     events::{ClanEvent, QuestTriggerEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
@@ -56,6 +56,18 @@ pub struct QuestSystemParameters<'w, 's> {
     object_variables_query: Query<'w, 's, (&'static mut ObjectVariables, &'static Position)>,
     party_query: Query<'w, 's, &'static Party>,
     clan_query: Query<'w, 's, &'static Clan>,
+    teleport_nearby_clan_members_query: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static ClientEntity,
+            &'static ClientEntitySector,
+            &'static Position,
+            Option<&'static GameClient>,
+            Option<&'static ClanMembership>,
+        ),
+    >,
 }
 
 #[derive(SystemParam)]
@@ -1575,6 +1587,99 @@ fn quest_reward_teleport(
     true
 }
 
+fn quest_reward_teleport_nearby_clan_members(
+    quest_system_parameters: &mut QuestSystemParameters,
+    quest_parameters: &mut QuestParameters,
+    distance: QsdDistance,
+    new_zone_id: QsdZoneId,
+    x: f32,
+    y: f32,
+) -> bool {
+    const CLAN_FIELD_RANGE_SCALE: f32 = 100.0;
+
+    let Some(source_clan_entity) = quest_parameters
+        .source
+        .clan_membership
+        .and_then(|clan_membership| clan_membership.clan())
+    else {
+        return false;
+    };
+
+    let Some(new_zone_id) = ZoneId::new(new_zone_id as u16) else {
+        return false;
+    };
+
+    let destination = Position::new(Vec3::new(x, y, 0.0), new_zone_id);
+
+    // Reward 028 range is stored in meter-like units; iROSE scales by 100 for world-distance checks.
+    let search_distance = ((distance as f32) * CLAN_FIELD_RANGE_SCALE).max(0.0);
+    let nearby_entities = quest_system_parameters
+        .client_entity_list
+        .get_zone(quest_parameters.source.position.zone_id)
+        .map(|client_entity_zone| {
+            client_entity_zone
+                .iter_entity_type_within_distance(
+                    quest_parameters.source.position.position.xy(),
+                    search_distance,
+                    &[ClientEntityType::Character],
+                )
+                .map(|(entity, _)| entity)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Always include the source character in clan field warp.
+    client_entity_teleport_zone(
+        &mut quest_system_parameters.commands,
+        &mut quest_system_parameters.client_entity_list,
+        quest_parameters.source.entity,
+        quest_parameters.source.client_entity,
+        quest_parameters.source.client_entity_sector,
+        quest_parameters.source.position,
+        destination.clone(),
+        quest_parameters.source.game_client,
+    );
+
+    for nearby_entity in nearby_entities {
+        if nearby_entity == quest_parameters.source.entity {
+            continue;
+        }
+
+        let Ok((
+            target_entity,
+            target_client_entity,
+            target_client_entity_sector,
+            target_position,
+            target_game_client,
+            target_clan_membership,
+        )) = quest_system_parameters
+            .teleport_nearby_clan_members_query
+            .get(nearby_entity)
+        else {
+            continue;
+        };
+
+        if target_clan_membership.and_then(|clan_membership| clan_membership.clan())
+            != Some(source_clan_entity)
+        {
+            continue;
+        }
+
+        client_entity_teleport_zone(
+            &mut quest_system_parameters.commands,
+            &mut quest_system_parameters.client_entity_list,
+            target_entity,
+            target_client_entity,
+            target_client_entity_sector,
+            target_position,
+            destination.clone(),
+            target_game_client,
+        );
+    }
+
+    true
+}
+
 fn quest_reward_ability_value(
     quest_system_resources: &QuestSystemResources,
     quest_parameters: &mut QuestParameters,
@@ -2337,6 +2442,19 @@ fn quest_trigger_apply_rewards(
             QsdReward::RemoveClanSkill { id } => {
                 quest_reward_clan_remove_skill(quest_system_parameters, quest_parameters, id)
             }
+            QsdReward::TeleportNearbyClanMembers {
+                distance,
+                zone,
+                x,
+                y,
+            } => quest_reward_teleport_nearby_clan_members(
+                quest_system_parameters,
+                quest_parameters,
+                distance,
+                zone,
+                x,
+                y,
+            ),
             _ => {
                 warn!("Unimplemented quest reward: {:?}", reward);
                 false
@@ -2346,7 +2464,6 @@ fn quest_trigger_apply_rewards(
               QsdReward::TriggerForZoneTeam(_, _, _) => todo!(),
               QsdReward::SetRevivePosition(_) => todo!(),
               QsdReward::ClanPointContribution(_, _) => todo!(),
-              QsdReward::TeleportNearbyClanMembers(_, _, _) => todo!(),
               */
         };
 

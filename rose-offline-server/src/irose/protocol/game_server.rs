@@ -429,6 +429,45 @@ impl GameServer {
                     description,
                     mark,
                 })?,
+                PacketClientClanCommand::SetDescription { description } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanSetDescription { description })?,
+                PacketClientClanCommand::Invite { name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanInvite { name })?
+                }
+                PacketClientClanCommand::Kick { name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanKick { name })?
+                }
+                PacketClientClanCommand::Promote { name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanPromote { name })?
+                }
+                PacketClientClanCommand::Demote { name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanDemote { name })?
+                }
+                PacketClientClanCommand::Leave => {
+                    client.client_message_tx.send(ClientMessage::ClanLeave)?
+                }
+                PacketClientClanCommand::Disband => {
+                    client.client_message_tx.send(ClientMessage::ClanDisband)?
+                }
+                PacketClientClanCommand::AcceptInvite { inviter_name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanAcceptInvite { inviter_name })?
+                }
+                PacketClientClanCommand::RejectInvite { inviter_name } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::ClanRejectInvite { inviter_name })?
+                }
             },
             _ => warn!(
                 "[GS] Unhandled packet [{:#03X}] {:02x?}",
@@ -1569,6 +1608,7 @@ impl GameServer {
                 level,
                 points,
                 money,
+                description,
                 skills,
             } => {
                 client
@@ -1579,6 +1619,7 @@ impl GameServer {
                         level,
                         points,
                         money,
+                        description,
                         skills,
                     }))
                     .await?;
@@ -1635,6 +1676,70 @@ impl GameServer {
                     .write_packet(Packet::from(&PacketServerClanCommand::ClanMemberList {
                         members,
                     }))
+                    .await?;
+            }
+            ServerMessage::ClanInvited {
+                name,
+                clan_unique_id,
+                clan_mark,
+                clan_level,
+                clan_name,
+                inviter_entity_id,
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanInvited {
+                        name,
+                        clan_unique_id,
+                        clan_mark,
+                        clan_level,
+                        clan_name,
+                        inviter_entity_id,
+                    }))
+                    .await?;
+            }
+            ServerMessage::ClanInviteResult { response } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanInviteResult {
+                        response,
+                    }))
+                    .await?;
+            }
+            ServerMessage::ClanMemberJoined { name } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(
+                        &PacketServerClanCommand::ClanMemberJoined { name },
+                    ))
+                    .await?;
+            }
+            ServerMessage::ClanMemberLeft { name } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(
+                        &PacketServerClanCommand::ClanMemberLeft { name },
+                    ))
+                    .await?;
+            }
+            ServerMessage::ClanMemberKicked { name } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(
+                        &PacketServerClanCommand::ClanMemberKicked { name },
+                    ))
+                    .await?;
+            }
+            ServerMessage::ClanKicked => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanKicked))
+                    .await?;
+            }
+            ServerMessage::ClanDisbanded => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanDisbanded))
                     .await?;
             }
             // These messages are for other servers

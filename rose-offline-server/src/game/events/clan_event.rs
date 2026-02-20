@@ -12,6 +12,37 @@ pub enum ClanEvent {
         name: String,
         description: String,
         mark: ClanMark,
+        skip_requirements: bool,
+    },
+    Invite {
+        inviter_entity: Entity,
+        name: String,
+    },
+    AcceptInvite {
+        invited_entity: Entity,
+        inviter_name: String,
+    },
+    RejectInvite {
+        invited_entity: Entity,
+        inviter_name: String,
+    },
+    Kick {
+        kicker_entity: Entity,
+        name: String,
+    },
+    Promote {
+        changer_entity: Entity,
+        name: String,
+    },
+    Demote {
+        changer_entity: Entity,
+        name: String,
+    },
+    Leave {
+        leaver_entity: Entity,
+    },
+    Disband {
+        entity: Entity,
     },
     MemberDisconnect {
         clan_entity: Entity,
@@ -22,6 +53,10 @@ pub enum ClanEvent {
     },
     GetMemberList {
         entity: Entity,
+    },
+    SetDescription {
+        updater_entity: Entity,
+        description: String,
     },
     AddLevel {
         clan_entity: Entity,

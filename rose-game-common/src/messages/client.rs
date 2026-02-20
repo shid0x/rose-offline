@@ -236,9 +236,32 @@ pub enum ClientMessage {
         description: String,
         mark: ClanMark,
     },
+    ClanSetDescription {
+        description: String,
+    },
     ClanGetMemberList,
     ClanUpdateCharacterInfo {
         level: Level,
         job: u16,
     },
+    ClanInvite {
+        name: String,
+    },
+    ClanAcceptInvite {
+        inviter_name: String,
+    },
+    ClanRejectInvite {
+        inviter_name: String,
+    },
+    ClanKick {
+        name: String,
+    },
+    ClanPromote {
+        name: String,
+    },
+    ClanDemote {
+        name: String,
+    },
+    ClanLeave,
+    ClanDisband,
 }

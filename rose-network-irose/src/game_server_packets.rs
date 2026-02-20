@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::{NonZeroU16, NonZeroUsize}, time::Duration};
 
 use bevy::math::{Vec2, Vec3};
 use bitvec::array::BitArray;
@@ -27,9 +27,10 @@ use rose_game_common::{
     messages::{
         server::{
             ActiveStatusEffects, CancelCastingSkillReason, CharacterClanMembership,
-            ClanCreateError, ClanMemberInfo, CraftInsertGemError, LearnSkillError,
-            LevelUpSkillError, NpcStoreTransactionError, PartyMemberInfo, PartyMemberInfoOnline,
-            PersonalStoreTransactionStatus, PickupItemDropError, SpawnCommandState,
+            ClanCreateError, ClanInviteResponse, ClanMemberInfo, CraftInsertGemError,
+            LearnSkillError, LevelUpSkillError, NpcStoreTransactionError, PartyMemberInfo,
+            PartyMemberInfoOnline, PersonalStoreTransactionStatus, PickupItemDropError,
+            SpawnCommandState,
         },
         ClientEntityId, PartyItemSharing, PartyRejectInviteReason, PartyXpSharing,
     },
@@ -4137,6 +4138,7 @@ pub enum PacketServerClanCommand {
         level: ClanLevel,
         points: ClanPoints,
         money: Money,
+        description: String,
         skills: Vec<SkillId>,
     },
     CharacterUpdateClan {
@@ -4160,6 +4162,28 @@ pub enum PacketServerClanCommand {
     ClanMemberList {
         members: Vec<ClanMemberInfo>,
     },
+    ClanInvited {
+        name: String,
+        clan_unique_id: ClanUniqueId,
+        clan_mark: ClanMark,
+        clan_level: ClanLevel,
+        clan_name: String,
+        inviter_entity_id: ClientEntityId,
+    },
+    ClanInviteResult {
+        response: ClanInviteResponse,
+    },
+    ClanMemberJoined {
+        name: String,
+    },
+    ClanMemberLeft {
+        name: String,
+    },
+    ClanMemberKicked {
+        name: String,
+    },
+    ClanKicked,
+    ClanDisbanded,
 }
 
 impl TryFrom<&Packet> for PacketServerClanCommand {
@@ -4265,12 +4289,18 @@ impl TryFrom<&Packet> for PacketServerClanCommand {
                     }
                 }
 
+                let description = reader
+                    .read_null_terminated_utf8()
+                    .unwrap_or_default()
+                    .to_string();
+
                 Ok(Self::ClanUpdateInfo {
                     id,
                     mark,
                     level,
                     points,
                     money,
+                    description,
                     skills,
                 })
             }
@@ -4313,6 +4343,63 @@ impl TryFrom<&Packet> for PacketServerClanCommand {
                     Ok(Self::ClanMemberConnected { name, channel_id })
                 } else {
                     Ok(Self::ClanMemberDisconnected { name })
+                }
+            }
+            0x0B => {
+                // GCMD_INVITE_REQ: server notifies target of invite
+                let name = reader.read_null_terminated_utf8()?.to_string();
+                // Read clan info that may follow
+                let clan_unique_id = ClanUniqueId::new(reader.read_u32().unwrap_or(0))
+                    .ok_or(PacketError::InvalidPacket)?;
+                let clan_mark = reader.read_clan_mark_u32().unwrap_or(ClanMark::Premade {
+                    background: NonZeroU16::new(1).unwrap(),
+                    foreground: NonZeroU16::new(1).unwrap(),
+                });
+                let clan_level_raw = reader.read_u8().unwrap_or(1);
+                let clan_level =
+                    ClanLevel::new(clan_level_raw as u32).ok_or(PacketError::InvalidPacket)?;
+                let clan_name = reader
+                    .read_null_terminated_utf8()
+                    .unwrap_or_default()
+                    .to_string();
+                let inviter_entity_id = reader.read_entity_id().unwrap_or(ClientEntityId(0));
+
+                Ok(Self::ClanInvited {
+                    name,
+                    clan_unique_id,
+                    clan_mark,
+                    clan_level,
+                    clan_name,
+                    inviter_entity_id,
+                })
+            }
+            0x51 => Ok(Self::ClanDisbanded),
+            0x61 => {
+                // RESULT_CLAN_JOIN_MEMBER: new member joined
+                let name = reader.read_null_terminated_utf8()?.to_string();
+                Ok(Self::ClanMemberJoined { name })
+            }
+            0x63 => Ok(Self::ClanInviteResult {
+                response: ClanInviteResponse::NoPermission,
+            }),
+            0x64 => Ok(Self::ClanInviteResult {
+                response: ClanInviteResponse::TargetHasClan,
+            }),
+            0x65 => Ok(Self::ClanInviteResult {
+                response: ClanInviteResponse::Full,
+            }),
+            0x81 => {
+                // RESULT_CLAN_KICK: someone was kicked
+                let name = reader.read_null_terminated_utf8()?.to_string();
+                Ok(Self::ClanMemberKicked { name })
+            }
+            0x82 => {
+                // RESULT_CLAN_QUIT: someone left or you were kicked
+                let name = reader.read_null_terminated_utf8().ok().map(|s| s.to_string());
+                if let Some(name) = name {
+                    Ok(Self::ClanMemberLeft { name })
+                } else {
+                    Ok(Self::ClanKicked)
                 }
             }
             _ => Err(PacketError::InvalidPacket),
@@ -4393,6 +4480,7 @@ impl From<&PacketServerClanCommand> for Packet {
                 level,
                 points,
                 money,
+                description,
                 skills,
             } => {
                 writer.write_u8(0x71);
@@ -4420,6 +4508,8 @@ impl From<&PacketServerClanCommand> for Packet {
                         writer.write_u32(0);
                     }
                 }
+
+                writer.write_null_terminated_utf8(description);
             }
             PacketServerClanCommand::ClanMemberList { members } => {
                 writer.write_u8(0x72);
@@ -4459,6 +4549,48 @@ impl From<&PacketServerClanCommand> for Packet {
                 ClanCreateError::NoPermission => writer.write_u8(0x43),
                 ClanCreateError::UnmetCondition => writer.write_u8(0x44),
             },
+            PacketServerClanCommand::ClanInvited {
+                name,
+                clan_unique_id,
+                clan_mark,
+                clan_level,
+                clan_name,
+                inviter_entity_id,
+            } => {
+                writer.write_u8(0x0B); // GCMD_INVITE_REQ
+                writer.write_null_terminated_utf8(name);
+                writer.write_u32(clan_unique_id.get());
+                writer.write_clan_mark_u32(clan_mark);
+                writer.write_u8(clan_level.get() as u8);
+                writer.write_null_terminated_utf8(clan_name);
+                writer.write_entity_id(*inviter_entity_id);
+            }
+            PacketServerClanCommand::ClanInviteResult { response } => match response {
+                ClanInviteResponse::NoPermission => writer.write_u8(0x63),
+                ClanInviteResponse::TargetHasClan => writer.write_u8(0x64),
+                ClanInviteResponse::Full => writer.write_u8(0x65),
+                ClanInviteResponse::TargetNotFound => writer.write_u8(0x63),
+                ClanInviteResponse::Rejected => writer.write_u8(0x63),
+                ClanInviteResponse::Accepted => writer.write_u8(0x63),
+            },
+            PacketServerClanCommand::ClanMemberJoined { name } => {
+                writer.write_u8(0x61); // RESULT_CLAN_JOIN_MEMBER
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerClanCommand::ClanMemberLeft { name } => {
+                writer.write_u8(0x82); // RESULT_CLAN_QUIT
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerClanCommand::ClanMemberKicked { name } => {
+                writer.write_u8(0x81); // RESULT_CLAN_KICK
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerClanCommand::ClanKicked => {
+                writer.write_u8(0x82); // RESULT_CLAN_QUIT (sent to self when kicked)
+            }
+            PacketServerClanCommand::ClanDisbanded => {
+                writer.write_u8(0x51); // RESULT_CLAN_DESTROYED
+            }
         }
 
         writer.into()

@@ -292,6 +292,17 @@ pub enum ClanCreateError {
     UnmetCondition,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClanInviteResponse {
+    NoPermission,
+    Full,
+    TargetHasClan,
+    TargetNotFound,
+    Rejected,
+    Accepted,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClanMemberInfo {
     pub name: String,
@@ -775,6 +786,7 @@ pub enum ServerMessage {
         level: ClanLevel,
         points: ClanPoints,
         money: Money,
+        description: String,
         skills: Vec<SkillId>,
     },
     CharacterUpdateClan {
@@ -798,4 +810,26 @@ pub enum ServerMessage {
     ClanMemberList {
         members: Vec<ClanMemberInfo>,
     },
+    ClanInvited {
+        name: String,
+        clan_unique_id: ClanUniqueId,
+        clan_mark: ClanMark,
+        clan_level: ClanLevel,
+        clan_name: String,
+        inviter_entity_id: ClientEntityId,
+    },
+    ClanInviteResult {
+        response: ClanInviteResponse,
+    },
+    ClanMemberJoined {
+        name: String,
+    },
+    ClanMemberLeft {
+        name: String,
+    },
+    ClanMemberKicked {
+        name: String,
+    },
+    ClanKicked,
+    ClanDisbanded,
 }

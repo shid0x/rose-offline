@@ -1532,6 +1532,29 @@ pub enum PacketClientClanCommand {
         description: String,
         mark: ClanMark,
     },
+    SetDescription {
+        description: String,
+    },
+    Invite {
+        name: String,
+    },
+    Kick {
+        name: String,
+    },
+    Promote {
+        name: String,
+    },
+    Demote {
+        name: String,
+    },
+    Leave,
+    Disband,
+    AcceptInvite {
+        inviter_name: String,
+    },
+    RejectInvite {
+        inviter_name: String,
+    },
 }
 
 impl TryFrom<&Packet> for PacketClientClanCommand {
@@ -1548,6 +1571,29 @@ impl TryFrom<&Packet> for PacketClientClanCommand {
                 mark: reader.read_clan_mark_u32()?,
                 name: reader.read_null_terminated_utf8()?.to_string(),
                 description: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            6 => Ok(PacketClientClanCommand::SetDescription {
+                description: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            2 => Ok(PacketClientClanCommand::Invite {
+                name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            3 => Ok(PacketClientClanCommand::Kick {
+                name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            11 => Ok(PacketClientClanCommand::Promote {
+                name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            12 => Ok(PacketClientClanCommand::Demote {
+                name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            7 => Ok(PacketClientClanCommand::Leave),
+            10 => Ok(PacketClientClanCommand::Disband),
+            4 => Ok(PacketClientClanCommand::AcceptInvite {
+                inviter_name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            5 => Ok(PacketClientClanCommand::RejectInvite {
+                inviter_name: reader.read_null_terminated_utf8()?.to_string(),
             }),
             _ => Err(PacketError::InvalidPacket),
         }
@@ -1567,6 +1613,40 @@ impl From<&PacketClientClanCommand> for Packet {
                 writer.write_clan_mark_u32(mark);
                 writer.write_null_terminated_utf8(name);
                 writer.write_null_terminated_utf8(description);
+            }
+            PacketClientClanCommand::SetDescription { description } => {
+                writer.write_u8(6);
+                writer.write_null_terminated_utf8(description);
+            }
+            PacketClientClanCommand::Invite { name } => {
+                writer.write_u8(2);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketClientClanCommand::Kick { name } => {
+                writer.write_u8(3);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketClientClanCommand::Promote { name } => {
+                writer.write_u8(11);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketClientClanCommand::Demote { name } => {
+                writer.write_u8(12);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketClientClanCommand::Leave => {
+                writer.write_u8(7);
+            }
+            PacketClientClanCommand::Disband => {
+                writer.write_u8(10);
+            }
+            PacketClientClanCommand::AcceptInvite { inviter_name } => {
+                writer.write_u8(4);
+                writer.write_null_terminated_utf8(inviter_name);
+            }
+            PacketClientClanCommand::RejectInvite { inviter_name } => {
+                writer.write_u8(5);
+                writer.write_null_terminated_utf8(inviter_name);
             }
         }
         writer.into()
