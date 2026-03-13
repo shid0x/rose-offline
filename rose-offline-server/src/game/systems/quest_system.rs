@@ -17,7 +17,9 @@ use chrono::{Datelike, Timelike};
 use log::warn;
 use rand::Rng;
 
-use rose_data::{EquipmentItem, Item, NpcId, QuestTrigger, SkillId, WorldTicks, ZoneId};
+use rose_data::{
+    AbilityType, EquipmentItem, Item, NpcId, QuestTrigger, SkillId, WorldTicks, ZoneId,
+};
 use rose_file_readers::{
     QsdAbilityType, QsdClanPoints, QsdCondition, QsdConditionOperator, QsdDistance,
     QsdEquipmentIndex, QsdEventId, QsdItem, QsdNpcId, QsdNpcMessageType, QsdObjectType, QsdQuestId,
@@ -34,9 +36,9 @@ use crate::game::{
     components::{
         AbilityValues, ActiveQuest, BasicStats, CharacterInfo, Clan, ClanMembership, ClientEntity,
         ClientEntitySector, ClientEntityType, Equipment, ExperiencePoints, GameClient,
-        HealthPoints, Inventory, Level, ManaPoints, Money, MoveSpeed, Npc, ObjectVariables,
-        Party, PartyMembership, Position, QuestState, SkillList, SkillPoints, SpawnOrigin,
-        Stamina, StatPoints, Team, UnionMembership,
+        HealthPoints, Inventory, Level, ManaPoints, Money, MoveSpeed, Npc, ObjectVariables, Party,
+        PartyMembership, Position, QuestState, SkillList, SkillPoints, SpawnOrigin, Stamina,
+        StatPoints, Team, UnionMembership,
     },
     events::{ClanEvent, QuestTriggerEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
@@ -117,6 +119,26 @@ struct QuestParameters<'a, 'b, 'w> {
     selected_npc: Option<Entity>,
     selected_quest_index: Option<usize>,
     next_trigger_name: Option<String>,
+}
+
+const CLAN_HOUSE_ZONE_ID: u16 = 15;
+const CLAN_HOUSE_BROKEN_QSD_X: f32 = 0.0;
+const CLAN_HOUSE_BROKEN_QSD_Y: f32 = 0.0;
+const CLAN_HOUSE_SAFE_POSITION_X: f32 = 519000.0;
+const CLAN_HOUSE_SAFE_POSITION_Y: f32 = 514000.0;
+
+fn resolve_quest_teleport_destination(new_zone_id: ZoneId, x: f32, y: f32) -> Position {
+    let destination = if new_zone_id.get() == CLAN_HOUSE_ZONE_ID
+        && x == CLAN_HOUSE_BROKEN_QSD_X
+        && y == CLAN_HOUSE_BROKEN_QSD_Y
+    {
+        // QC001.QSD Clan-033 / Clan-034 currently ship with zone 15 at (0, 0).
+        Vec3::new(CLAN_HOUSE_SAFE_POSITION_X, CLAN_HOUSE_SAFE_POSITION_Y, 0.0)
+    } else {
+        Vec3::new(x, y, 0.0)
+    };
+
+    Position::new(destination, new_zone_id)
 }
 
 fn quest_condition_operator<T: PartialEq + PartialOrd>(
@@ -1574,6 +1596,8 @@ fn quest_reward_teleport(
     new_zone_id: ZoneId,
     new_position: Vec3,
 ) -> bool {
+    let destination =
+        resolve_quest_teleport_destination(new_zone_id, new_position.x, new_position.y);
     client_entity_teleport_zone(
         &mut quest_system_parameters.commands,
         &mut quest_system_parameters.client_entity_list,
@@ -1581,7 +1605,7 @@ fn quest_reward_teleport(
         quest_parameters.source.client_entity,
         quest_parameters.source.client_entity_sector,
         quest_parameters.source.position,
-        Position::new(new_position, new_zone_id),
+        destination,
         quest_parameters.source.game_client,
     );
     true
@@ -1678,6 +1702,29 @@ fn quest_reward_teleport_nearby_clan_members(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::Vec3;
+    use rose_data::ZoneId;
+
+    use super::resolve_quest_teleport_destination;
+
+    #[test]
+    fn broken_clan_house_qsd_teleport_uses_safe_server_destination() {
+        let destination = resolve_quest_teleport_destination(ZoneId::new(15).unwrap(), 0.0, 0.0);
+
+        assert_eq!(destination.position, Vec3::new(519000.0, 514000.0, 0.0));
+    }
+
+    #[test]
+    fn non_broken_teleport_preserves_original_coordinates() {
+        let destination =
+            resolve_quest_teleport_destination(ZoneId::new(15).unwrap(), 100.0, 200.0);
+
+        assert_eq!(destination.position, Vec3::new(100.0, 200.0, 0.0));
+    }
 }
 
 fn quest_reward_ability_value(
@@ -1967,20 +2014,45 @@ fn quest_reward_clear_switch_group(quest_parameters: &mut QuestParameters, group
 }
 
 fn quest_reward_set_team_number(
+    quest_system_parameters: &QuestSystemParameters,
     quest_parameters: &mut QuestParameters,
     source: QsdTeamNumberSource,
 ) -> bool {
+    const PARTY_TEAM_BASE: u32 = 1_000_000;
+
     let team = match source {
-        QsdTeamNumberSource::Unique => {
-            Team::with_unique_id(quest_parameters.source.client_entity.id.0 as u32)
-        }
-        _ => {
-            warn!("Unimplemented set team number source {:?}", source);
-            return false;
-        }
+        QsdTeamNumberSource::Unique => Some(Team::with_unique_id(
+            quest_parameters.source.client_entity.id.0 as u32,
+        )),
+        QsdTeamNumberSource::Clan => quest_parameters
+            .source
+            .clan_membership
+            .and_then(|clan_membership| clan_membership.clan())
+            .and_then(|clan_entity| quest_system_parameters.clan_query.get(clan_entity).ok())
+            .map(|clan| Team::new(clan.unique_id.get())),
+        QsdTeamNumberSource::Party => quest_parameters
+            .source
+            .party_membership
+            .and_then(|party_membership| party_membership.party)
+            .map(|party_entity| Team::new(PARTY_TEAM_BASE.saturating_add(party_entity.index()))),
+    };
+
+    let Some(team) = team else {
+        return false;
     };
 
     *quest_parameters.source.team = team;
+
+    if let Some(game_client) = quest_parameters.source.game_client {
+        game_client
+            .server_message_tx
+            .send(ServerMessage::UpdateAbilityValueSet {
+                ability_type: AbilityType::TeamNumber,
+                value: quest_parameters.source.team.id as i32,
+            })
+            .ok();
+    }
+
     true
 }
 
@@ -2007,6 +2079,66 @@ fn quest_reward_set_monster_spawn_state(
         quest_system_parameters
             .zone_list
             .set_monster_spawns_enabled(zone_id, enabled)
+    } else {
+        false
+    }
+}
+
+fn quest_reward_trigger_for_zone_team(
+    quest_system_parameters: &mut QuestSystemParameters,
+    source_zone_id: ZoneId,
+    zone_id: QsdZoneId,
+    team_number: QsdTeamNumber,
+    trigger: &str,
+) -> bool {
+    let zone_id = if zone_id == 0 {
+        source_zone_id
+    } else {
+        let Some(zone_id) = ZoneId::new(zone_id as u16) else {
+            return false;
+        };
+        zone_id
+    };
+
+    let team_number = team_number as u32;
+    let trigger_name = trigger.to_string();
+    quest_system_parameters
+        .commands
+        .add(move |world: &mut bevy::prelude::World| {
+            let mut send_list = Vec::new();
+            let mut query = world.query::<(Entity, &ClientEntity, &Position, &Team)>();
+            for (entity, client_entity, position, team) in query.iter(world) {
+                if !matches!(client_entity.entity_type, ClientEntityType::Character) {
+                    continue;
+                }
+
+                if position.zone_id == zone_id && team.id == team_number {
+                    send_list.push(entity);
+                }
+            }
+
+            let events = &mut world.resource_mut::<bevy::ecs::event::Events<QuestTriggerEvent>>();
+            for entity in send_list {
+                events.send(QuestTriggerEvent {
+                    trigger_entity: entity,
+                    trigger_hash: trigger_name.as_str().into(),
+                });
+            }
+        });
+
+    true
+}
+
+fn quest_reward_set_revive_position(
+    quest_parameters: &mut QuestParameters,
+    x: f32,
+    y: f32,
+) -> bool {
+    if let Some(character_info) = quest_parameters.source.character_info.as_mut() {
+        character_info.revive_zone_id = quest_parameters.source.position.zone_id;
+        character_info.revive_position =
+            Vec3::new(x, y, quest_parameters.source.position.position.z);
+        true
     } else {
         false
     }
@@ -2400,7 +2532,21 @@ fn quest_trigger_apply_rewards(
                 quest_reward_clear_switch_group(quest_parameters, group)
             }
             QsdReward::SetTeamNumber { source } => {
-                quest_reward_set_team_number(quest_parameters, source)
+                quest_reward_set_team_number(quest_system_parameters, quest_parameters, source)
+            }
+            QsdReward::TriggerForZoneTeam {
+                zone,
+                team_number,
+                ref trigger,
+            } => quest_reward_trigger_for_zone_team(
+                quest_system_parameters,
+                quest_parameters.source.position.zone_id,
+                zone,
+                team_number,
+                trigger.as_str(),
+            ),
+            QsdReward::SetRevivePosition { x, y } => {
+                quest_reward_set_revive_position(quest_parameters, x, y)
             }
             QsdReward::EnableMonsterSpawns { zone } => quest_reward_set_monster_spawn_state(
                 quest_system_parameters,
@@ -2461,8 +2607,6 @@ fn quest_trigger_apply_rewards(
             } /*
               QsdReward::TriggerAfterDelay(_, _, _) => todo!(),
               QsdReward::FormatAnnounceMessage(_, _) => todo!(),
-              QsdReward::TriggerForZoneTeam(_, _, _) => todo!(),
-              QsdReward::SetRevivePosition(_) => todo!(),
               QsdReward::ClanPointContribution(_, _) => todo!(),
               */
         };

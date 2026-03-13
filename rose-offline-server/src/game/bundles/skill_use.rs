@@ -9,9 +9,11 @@ use rose_data::{
 use crate::game::{
     components::{
         AbilityValues, ClanMembership, ClientEntity, ClientEntityType, Cooldowns, Equipment,
-        ExperiencePoints, HealthPoints, Inventory, ManaPoints, MoveMode, PartyMembership, Stamina,
-        Team,
+        ExperiencePoints, HealthPoints, Inventory, ManaPoints, MoveMode, PartyMembership, Position,
+        Stamina, SummonUsage, Team,
     },
+    pvp::can_character_attack_character,
+    resources::ZoneList,
     GameData,
 };
 
@@ -25,6 +27,7 @@ pub struct SkillCasterBundle<'w> {
     pub client_entity: &'w ClientEntity,
     pub health_points: &'w HealthPoints,
     pub move_mode: &'w MoveMode,
+    pub position: &'w Position,
     pub team: &'w Team,
 
     pub clan_membership: Option<&'w ClanMembership>,
@@ -35,6 +38,7 @@ pub struct SkillCasterBundle<'w> {
     pub mana_points: Option<&'w ManaPoints>,
     pub party_membership: Option<&'w PartyMembership>,
     pub stamina: Option<&'w Stamina>,
+    pub summon_usage: Option<&'w SummonUsage>,
 }
 
 #[derive(WorldQuery)]
@@ -43,6 +47,7 @@ pub struct SkillTargetBundle<'w> {
 
     pub client_entity: &'w ClientEntity,
     pub health_points: &'w HealthPoints,
+    pub position: &'w Position,
     pub team: &'w Team,
 
     pub clan_membership: Option<&'w ClanMembership>,
@@ -103,6 +108,8 @@ fn check_move_mode(skill_caster: &SkillCasterBundleItem, _skill_data: &SkillData
 }
 
 fn check_skill_target_filter(
+    game_data: &GameData,
+    zone_list: &ZoneList,
     skill_caster: &SkillCasterBundleItem,
     skill_target: &SkillTargetBundleItem,
     skill_data: &SkillData,
@@ -143,11 +150,73 @@ fn check_skill_target_filter(
                 )
         }
         SkillTargetFilter::Enemy => {
+            if target_is_alive
+                && matches!(
+                    skill_caster.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+                && matches!(
+                    skill_target.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+            {
+                if target_is_caster {
+                    return false;
+                }
+
+                if skill_caster.position.zone_id != skill_target.position.zone_id {
+                    return false;
+                }
+
+                let Some(zone_data) = game_data.zones.get_zone(skill_caster.position.zone_id)
+                else {
+                    return false;
+                };
+
+                return can_character_attack_character(
+                    zone_data,
+                    zone_list.get_pvp_enabled(skill_caster.position.zone_id),
+                    skill_caster.team.id,
+                    skill_target.team.id,
+                );
+            }
+
             target_is_alive
                 && skill_target.team.id != Team::DEFAULT_NPC_TEAM_ID
                 && skill_caster.team.id != skill_target.team.id
         }
         SkillTargetFilter::EnemyCharacter => {
+            if target_is_alive
+                && matches!(
+                    skill_caster.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+                && matches!(
+                    skill_target.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+            {
+                if target_is_caster {
+                    return false;
+                }
+
+                if skill_caster.position.zone_id != skill_target.position.zone_id {
+                    return false;
+                }
+
+                let Some(zone_data) = game_data.zones.get_zone(skill_caster.position.zone_id)
+                else {
+                    return false;
+                };
+
+                return can_character_attack_character(
+                    zone_data,
+                    zone_list.get_pvp_enabled(skill_caster.position.zone_id),
+                    skill_caster.team.id,
+                    skill_target.team.id,
+                );
+            }
+
             target_is_alive
                 && skill_caster.team.id != skill_target.team.id
                 && matches!(
@@ -191,16 +260,36 @@ fn check_skill_target_filter(
 
 fn check_summon_points(
     game_data: &GameData,
-    _skill_caster: &SkillCasterBundleItem,
+    skill_caster: &SkillCasterBundleItem,
     skill_data: &SkillData,
 ) -> bool {
     if matches!(skill_data.skill_type, SkillType::SummonPet) {
-        let summon_point_requirement = skill_data
-            .summon_npc_id
-            .and_then(|npc_id| game_data.npcs.get_npc(npc_id))
-            .map_or(0, |npc_data| npc_data.summon_point_requirement);
+        let Some(summon_npc_id) = skill_data.summon_npc_id else {
+            log::warn!(
+                "SkillId {} is SummonPet but has no summon_npc_id configured",
+                skill_data.id.get()
+            );
+            return false;
+        };
+
+        let Some(summon_npc_data) = game_data.npcs.get_npc(summon_npc_id) else {
+            log::warn!(
+                "SkillId {} references missing summon NPC {}",
+                skill_data.id.get(),
+                summon_npc_id.get()
+            );
+            return false;
+        };
+
+        let summon_point_requirement = summon_npc_data.summon_point_requirement;
         if summon_point_requirement > 0 {
-            // TODO: check_summon_points
+            let used_points = skill_caster
+                .summon_usage
+                .map_or(0, |summon_usage| summon_usage.used_points);
+            let max_points = skill_caster.ability_values.get_max_summon_points();
+            if used_points.saturating_add(summon_point_requirement) > max_points {
+                return false;
+            }
         }
     }
 
@@ -342,24 +431,34 @@ pub fn skill_can_use(
 }
 
 pub fn skill_can_target_entity(
+    game_data: &GameData,
+    zone_list: &ZoneList,
     skill_caster: &SkillCasterBundleItem,
     skill_target: &SkillTargetBundleItem,
     skill_data: &SkillData,
 ) -> bool {
-    if !check_skill_target_filter(skill_caster, skill_target, skill_data) {
+    if !check_skill_target_filter(game_data, zone_list, skill_caster, skill_target, skill_data) {
         return false;
     }
 
     true
 }
 
-pub fn skill_can_target_self(skill_caster: &SkillCasterBundleItem, skill_data: &SkillData) -> bool {
+pub fn skill_can_target_self(
+    game_data: &GameData,
+    zone_list: &ZoneList,
+    skill_caster: &SkillCasterBundleItem,
+    skill_data: &SkillData,
+) -> bool {
     if !check_skill_target_filter(
+        game_data,
+        zone_list,
         skill_caster,
         &SkillTargetBundleItem {
             entity: skill_caster.entity,
             client_entity: skill_caster.client_entity,
             health_points: skill_caster.health_points,
+            position: skill_caster.position,
             clan_membership: skill_caster.clan_membership,
             party_membership: skill_caster.party_membership,
             team: skill_caster.team,

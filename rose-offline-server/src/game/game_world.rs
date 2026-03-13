@@ -20,24 +20,26 @@ use crate::game::{
     },
     messages::control::ControlMessage,
     resources::{
-        BotList, ClientEntityList, ControlChannel, GameConfig, GameData, LoginTokens, ServerList,
-        ServerMessages, WorldRates, WorldTime, ZoneList,
+        BotList, ClientEntityList, ControlChannel, GameConfig, GameData, LoginTokens,
+        OnlineFriends, ServerList, ServerMessages, WorldRates, WorldTime, ZoneList,
     },
     systems::{
         ability_values_changed_system, ability_values_update_character_system,
-        ability_values_update_npc_system, bank_system, chat_commands_system, clan_system,
-        client_entity_visibility_system, command_system, control_server_system, damage_system,
-        driving_time_system, equipment_event_system, experience_points_system, expire_time_system,
-        game_server_authentication_system, game_server_join_system, game_server_main_system,
-        item_life_system, login_server_authentication_system, login_server_system,
-        monster_spawn_system, npc_ai_system, npc_store_system, party_member_event_system,
-        party_member_update_info_system, party_system, party_update_average_level_system,
-        passive_recovery_system, personal_store_system, pickup_item_system, quest_system,
-        revive_event_system, reward_item_system, save_system, server_messages_system,
-        skill_effect_system, startup_clans_system, startup_zones_system, status_effect_system,
-        update_character_motion_data_system, update_npc_motion_data_system, update_position_system,
-        use_ammo_system, use_item_system, weight_system, world_server_authentication_system,
-        world_server_system, world_time_system,
+        ability_values_update_npc_system, bank_system, bonfire_aura_system, chat_commands_system,
+        clan_system, client_entity_visibility_system, command_system, control_server_system,
+        damage_system, driving_time_system, equipment_event_system, experience_points_system,
+        expire_time_system, game_server_authentication_system, game_server_join_system,
+        game_server_main_system, item_life_system, login_server_authentication_system,
+        login_server_system, monster_spawn_system, npc_ai_system, npc_store_system,
+        party_member_event_system, party_member_update_info_system, party_system,
+        party_update_average_level_system, passive_recovery_system, personal_store_system,
+        pickup_item_system, quest_system, revive_event_system, reward_item_system, save_system,
+        server_messages_system, skill_effect_system, startup_clans_system, startup_zones_system,
+        status_effect_system, summon_points_dead_cleanup_system,
+        summon_points_owner_cleanup_system, summon_points_owner_reset_system,
+        summon_points_sync_system, update_character_motion_data_system,
+        update_npc_motion_data_system, update_position_system, use_ammo_system, use_item_system,
+        weight_system, world_server_authentication_system, world_server_system, world_time_system,
     },
 };
 
@@ -61,6 +63,7 @@ impl GameWorld {
         app.insert_resource(ClientEntityList::new(&game_data.zones));
         app.insert_resource(ControlChannel::new(self.control_rx.clone()));
         app.insert_resource(LoginTokens::new());
+        app.insert_resource(OnlineFriends::default());
         app.insert_resource(ServerList::new());
         app.insert_resource(ServerMessages::new());
         app.insert_resource(WorldRates::new());
@@ -115,12 +118,16 @@ impl GameWorld {
                     (game_server_main_system, revive_event_system).chain(),
                     chat_commands_system,
                     monster_spawn_system,
+                    summon_points_dead_cleanup_system,
+                    summon_points_owner_cleanup_system,
+                    summon_points_owner_reset_system,
                     npc_ai_system,
                     expire_time_system,
                     status_effect_system,
-                    passive_recovery_system,
                     driving_time_system,
                 ),
+                apply_deferred,
+                bonfire_aura_system,
                 apply_deferred,
                 (
                     (
@@ -177,6 +184,8 @@ impl GameWorld {
                 ability_values_update_character_system.before(ability_values_changed_system),
                 ability_values_update_npc_system.before(ability_values_changed_system),
                 ability_values_changed_system,
+                passive_recovery_system,
+                summon_points_sync_system.before(server_messages_system),
                 server_messages_system,
                 save_system,
             ),

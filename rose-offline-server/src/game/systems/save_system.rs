@@ -9,14 +9,16 @@ use crate::game::{
     bundles::client_entity_leave_zone,
     components::{
         Account, Bank, BasicStats, CharacterInfo, ClanMembership, ClientEntity, ClientEntitySector,
-        Equipment, ExperiencePoints, HealthPoints, Hotbar, Inventory, Level, ManaPoints,
-        PartyMembership, Position, QuestState, SkillList, SkillPoints, Stamina, StatPoints,
-        UnionMembership,
+        Equipment, ExperiencePoints, FriendList, GameClient, HealthPoints, Hotbar, Inventory,
+        Level, ManaPoints, PartyMembership, Position, QuestState, SkillList, SkillPoints, Stamina,
+        StatPoints, UnionMembership,
     },
     events::{ClanEvent, PartyMemberEvent, SaveEvent},
-    resources::ClientEntityList,
+    messages::server::ServerMessage,
+    resources::{ClientEntityList, OnlineFriends},
     storage::{bank::BankStorage, character::CharacterStorage},
 };
+use rose_game_common::messages::FriendStatus;
 
 #[derive(WorldQuery)]
 pub struct SaveEntityQuery<'w> {
@@ -26,6 +28,7 @@ pub struct SaveEntityQuery<'w> {
     character_info: &'w CharacterInfo,
     basic_stats: &'w BasicStats,
     bank: &'w Bank,
+    friend_list: &'w FriendList,
     inventory: &'w Inventory,
     equipment: &'w Equipment,
     level: &'w Level,
@@ -47,7 +50,9 @@ pub struct SaveEntityQuery<'w> {
 pub fn save_system(
     mut commands: Commands,
     query: Query<SaveEntityQuery>,
+    query_game_clients: Query<(&GameClient, &FriendList)>,
     mut client_entity_list: ResMut<ClientEntityList>,
+    mut online_friends: ResMut<OnlineFriends>,
     mut save_events: EventReader<SaveEvent>,
     mut clan_events: EventWriter<ClanEvent>,
     mut party_member_events: EventWriter<PartyMemberEvent>,
@@ -62,6 +67,7 @@ pub fn save_system(
                     let storage = CharacterStorage {
                         info: character.character_info.clone(),
                         basic_stats: character.basic_stats.clone(),
+                        friends: character.friend_list.friends.clone(),
                         inventory: character.inventory.clone(),
                         equipment: character.equipment.clone(),
                         level: *character.level,
@@ -96,6 +102,37 @@ pub fn save_system(
                     }
 
                     if remove_after_save {
+                        let recipient_entities = character
+                            .friend_list
+                            .friends
+                            .iter()
+                            .filter_map(|friend| online_friends.get_by_id(friend.character_id))
+                            .map(|online_friend| online_friend.entity)
+                            .collect::<Vec<_>>();
+
+                        for recipient_entity in recipient_entities {
+                            if let Ok((recipient_game_client, recipient_friend_list)) =
+                                query_game_clients.get(recipient_entity)
+                            {
+                                if recipient_friend_list.friends.iter().any(|friend| {
+                                    friend.character_id == character.character_info.unique_id
+                                }) {
+                                    recipient_game_client
+                                        .server_message_tx
+                                        .send(ServerMessage::FriendStatusChanged {
+                                            friend_id: character.character_info.unique_id,
+                                            status: FriendStatus::Offline,
+                                        })
+                                        .ok();
+                                }
+                            }
+                        }
+
+                        online_friends.remove(
+                            character.character_info.unique_id,
+                            &character.character_info.name,
+                        );
+
                         if let (Some(client_entity), Some(client_entity_sector)) =
                             (character.client_entity, character.client_entity_sector)
                         {

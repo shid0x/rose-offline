@@ -3,8 +3,9 @@ use std::sync::Arc;
 use rose_data::{CharacterMotionDatabaseOptions, NpcDatabaseOptions};
 use rose_data_irose::{
     get_ai_database, get_character_motion_database, get_data_decoder, get_item_database,
-    get_job_class_database, get_npc_database, get_quest_database, get_skill_database,
-    get_status_effect_database, get_string_database, get_warp_gate_database, get_zone_database,
+    get_job_class_database, get_npc_database, get_product_database, get_quest_database,
+    get_skill_database, get_status_effect_database, get_string_database, get_warp_gate_database,
+    get_zone_database,
 };
 use rose_file_readers::VirtualFilesystem;
 use rose_game_irose::data::{get_ability_value_calculator, get_drop_table};
@@ -70,6 +71,7 @@ pub fn get_game_data(vfs: &VirtualFilesystem) -> GameData {
             .expect("Failed to load motion database"),
         ),
         npcs: npc_database,
+        products: Arc::new(get_product_database(vfs).expect("Failed to load product database")),
         quests: Arc::new(
             get_quest_database(vfs, string_database.clone())
                 .expect("Failed to load quest database"),

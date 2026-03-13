@@ -40,6 +40,10 @@ pub struct ZoneData {
     pub id: ZoneId,
     pub name: &'static str,
     pub description: &'static str,
+    pub pvp_state: u32,
+    pub join_trigger: Option<String>,
+    pub kill_trigger: Option<String>,
+    pub dead_trigger: Option<String>,
     pub sector_size: u32,
     pub grid_per_patch: f32,
     pub grid_size: f32,
@@ -58,6 +62,8 @@ pub struct ZoneData {
     pub evening_time: u32,
     pub night_time: u32,
     pub skybox_id: Option<SkyboxId>,
+    pub party_xp_a: u32,
+    pub party_xp_b: u32,
 }
 
 impl ZoneData {

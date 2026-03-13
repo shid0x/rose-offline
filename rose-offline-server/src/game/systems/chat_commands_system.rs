@@ -23,7 +23,9 @@ use rose_data::{
     StackableItem, ZoneId,
 };
 use rose_game_common::{
-    components::{BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot},
+    components::{
+        BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot,
+    },
     data::Damage,
     messages::server::PersonalStoreTransactionStatus,
 };
@@ -43,8 +45,8 @@ use crate::game::{
         ClientEntitySector, ClientEntityType, Command, Cooldowns, DamageSources,
         EquipmentItemDatabase, GameClient, HealthPoints, Inventory, InventoryPageType, Level,
         ManaPoints, Money, MotionData, MoveMode, MoveSpeed, NextCommand, PartyMembership,
-        PassiveRecoveryTime, PersonalStore, Position, SkillList, SkillPoints, SpawnOrigin, Stamina,
-        StatPoints, StatusEffects, StatusEffectsRegen, Team, UnionMembership,
+        PassiveRecoveryTime, PersonalStore, Position, RecoveryRateBonus, SkillList, SkillPoints,
+        SpawnOrigin, Stamina, StatPoints, StatusEffects, StatusEffectsRegen, Team, UnionMembership,
         PERSONAL_STORE_ITEM_SLOTS,
     },
     events::{ChatCommandEvent, ClanEvent, DamageEvent, RewardItemEvent, RewardXpEvent},
@@ -188,14 +190,8 @@ lazy_static! {
             )
             .subcommand(
                 clap::Command::new("clan")
-                    .subcommand(
-                        clap::Command::new("create")
-                            .arg(Arg::new("name").required(true)),
-                    )
-                    .subcommand(
-                        clap::Command::new("invite")
-                            .arg(Arg::new("name").required(true)),
-                    )
+                    .subcommand(clap::Command::new("create").arg(Arg::new("name").required(true)))
+                    .subcommand(clap::Command::new("invite").arg(Arg::new("name").required(true)))
                     .subcommand(
                         clap::Command::new("level")
                             .arg(
@@ -244,9 +240,7 @@ lazy_static! {
                             )
                             .arg(Arg::new("value").required(true)),
                     )
-                    .subcommand(
-                        clap::Command::new("leave"),
-                    ),
+                    .subcommand(clap::Command::new("leave")),
             )
             .subcommand(
                 clap::Command::new("rate")
@@ -486,12 +480,14 @@ fn create_bot_entity(
                 passive_recovery_time: PassiveRecoveryTime::default(),
                 position: bot_data.position,
                 quest_state: bot_data.quest_state,
+                recovery_rate_bonus: RecoveryRateBonus::default(),
                 skill_list: bot_data.skill_list,
                 skill_points: bot_data.skill_points,
                 stamina: bot_data.stamina,
                 stat_points: bot_data.stat_points,
                 status_effects,
                 status_effects_regen,
+                summon_usage: Default::default(),
                 team: Team::default_character(),
                 union_membership: bot_data.union_membership,
                 clan_membership: ClanMembership::default(),

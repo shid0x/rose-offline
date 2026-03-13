@@ -49,7 +49,7 @@ pub enum SkillTargetFilter {
     EnemyMonster,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SkillType {
     BasicAction,
     CreateWindow,

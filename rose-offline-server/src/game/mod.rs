@@ -2,6 +2,7 @@ mod bots;
 mod bundles;
 mod events;
 mod game_world;
+mod pvp;
 mod resources;
 mod systems;
 

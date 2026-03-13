@@ -173,10 +173,7 @@ async fn async_main() {
     let game_data = irose::get_game_data(&virtual_filesystem);
     debug!("Time take to read game data {:?}", started_load.elapsed());
 
-    let game_config = GameConfig {
-        enable_npc_spawns: true,
-        enable_monster_spawns: true,
-    };
+    let game_config = GameConfig::default();
 
     let (game_control_tx, game_control_rx) = crossbeam_channel::unbounded();
     std::thread::spawn(move || {

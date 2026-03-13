@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bevy::{
     ecs::{
-        prelude::{Commands, Entity, EventReader, Query, Res, ResMut},
+        prelude::{Commands, Entity, EventReader, EventWriter, Mut, Query, Res, ResMut},
         query::WorldQuery,
         system::SystemParam,
     },
@@ -20,12 +20,12 @@ use crate::game::{
         skill_list_try_learn_skill, SkillListBundle,
     },
     components::{
-        AbilityValues, BasicStats, CharacterInfo, ClientEntity, ClientEntitySector,
+        AbilityValues, BasicStats, CharacterInfo, ClanMembership, ClientEntity, ClientEntitySector,
         ExperiencePoints, GameClient, Inventory, ItemSlot, Level, MoveSpeed, NextCommand, Position,
         SkillList, SkillPoints, Stamina, StatPoints, StatusEffects, StatusEffectsRegen, Team,
         UnionMembership,
     },
-    events::UseItemEvent,
+    events::{ClanEvent, UseItemEvent},
     messages::server::ServerMessage,
     resources::{ClientEntityList, ServerMessages},
     GameData,
@@ -34,6 +34,7 @@ use crate::game::{
 #[derive(SystemParam)]
 pub struct UseItemSystemParameters<'w, 's> {
     commands: Commands<'w, 's>,
+    clan_events: EventWriter<'w, ClanEvent>,
     game_data: Res<'w, GameData>,
     client_entity_list: ResMut<'w, ClientEntityList>,
     server_messages: ResMut<'w, ServerMessages>,
@@ -47,6 +48,7 @@ pub struct UseItemUserQuery<'w> {
     ability_values: &'w AbilityValues,
     basic_stats: &'w mut BasicStats,
     character_info: &'w CharacterInfo,
+    clan_membership: Option<&'w ClanMembership>,
     client_entity: &'w ClientEntity,
     client_entity_sector: &'w ClientEntitySector,
     experience_points: &'w mut ExperiencePoints,
@@ -73,14 +75,59 @@ enum UseItemError {
     AbilityRequirement,
 }
 
+fn apply_item_add_ability(
+    clan_membership: Option<&ClanMembership>,
+    clan_events: &mut EventWriter<ClanEvent>,
+    add_ability_type: AbilityType,
+    add_ability_value: i32,
+    ability_values: Option<&AbilityValues>,
+    basic_stats: Option<&mut Mut<BasicStats>>,
+    experience_points: Option<&mut Mut<ExperiencePoints>>,
+    health_points: Option<&mut Mut<HealthPoints>>,
+    inventory: Option<&mut Mut<Inventory>>,
+    mana_points: Option<&mut Mut<ManaPoints>>,
+    skill_points: Option<&mut Mut<SkillPoints>>,
+    stamina: Option<&mut Mut<Stamina>>,
+    stat_points: Option<&mut Mut<StatPoints>>,
+    union_membership: Option<&mut Mut<UnionMembership>>,
+    game_client: Option<&GameClient>,
+) {
+    if matches!(add_ability_type, AbilityType::GuildScore) {
+        if let Some(clan_entity) = clan_membership.and_then(ClanMembership::clan) {
+            clan_events.send(ClanEvent::AddPoints {
+                clan_entity,
+                points: add_ability_value as i64,
+            });
+        }
+        return;
+    }
+
+    ability_values_add_value(
+        add_ability_type,
+        add_ability_value,
+        ability_values,
+        basic_stats,
+        experience_points,
+        health_points,
+        inventory,
+        mana_points,
+        skill_points,
+        stamina,
+        stat_points,
+        union_membership,
+        game_client,
+    );
+}
+
 fn apply_item_effect(
-    use_item_system_parameters: &UseItemSystemParameters,
+    clan_events: &mut EventWriter<ClanEvent>,
+    game_data: &GameData,
+    time: &Time,
     use_item_user: &mut UseItemUserQueryItem,
     item_data: &rose_data::ConsumableItemData,
 ) {
     if let Some((base_status_effect_id, total_potion_value)) = item_data.apply_status_effect {
-        if let Some(base_status_effect) = use_item_system_parameters
-            .game_data
+        if let Some(base_status_effect) = game_data
             .status_effects
             .get_status_effect(base_status_effect_id)
         {
@@ -88,8 +135,7 @@ fn apply_item_effect(
                 .apply_status_effects
                 .iter()
                 .filter_map(|(id, value)| {
-                    use_item_system_parameters
-                        .game_data
+                    game_data
                         .status_effects
                         .get_status_effect(*id)
                         .map(|data| (data, value))
@@ -102,7 +148,7 @@ fn apply_item_effect(
                     use_item_user.status_effects.apply_potion(
                         &mut use_item_user.status_effects_regen,
                         status_effect_data,
-                        use_item_system_parameters.time.last_update().unwrap()
+                        time.last_update().unwrap()
                             + Duration::from_micros(
                                 total_potion_value as u64 * 1000000
                                     / potion_value_per_second as u64,
@@ -114,7 +160,9 @@ fn apply_item_effect(
             }
         }
     } else if let Some((add_ability_type, add_ability_value)) = item_data.add_ability {
-        ability_values_add_value(
+        apply_item_add_ability(
+            use_item_user.clan_membership,
+            clan_events,
             add_ability_type,
             add_ability_value,
             Some(use_item_user.ability_values),
@@ -322,7 +370,10 @@ fn use_inventory_item(
             (false, false)
         }
         _ => {
-            apply_item_effect(use_item_system_parameters, use_item_user, item_data);
+            let game_data = &use_item_system_parameters.game_data;
+            let time = &use_item_system_parameters.time;
+            let clan_events = &mut use_item_system_parameters.clan_events;
+            apply_item_effect(clan_events, game_data, time, use_item_user, item_data);
             (true, true)
         }
     };
@@ -405,8 +456,13 @@ pub fn use_item_system(
                         .items
                         .get_consumable_item(item.get_item_number())
                     {
+                        let game_data = &use_item_system_parameters.game_data;
+                        let time = &use_item_system_parameters.time;
+                        let clan_events = &mut use_item_system_parameters.clan_events;
                         apply_item_effect(
-                            &use_item_system_parameters,
+                            clan_events,
+                            game_data,
+                            time,
                             &mut use_item_user,
                             item_data,
                         );
@@ -424,5 +480,274 @@ pub fn use_item_system(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::{
+        app::App,
+        ecs::{
+            event::{EventWriter, Events, ManualEventReader},
+            system::{Query, Res},
+        },
+        prelude::{Entity, Resource},
+    };
+
+    use rose_data::AbilityType;
+    use rose_game_common::components::{
+        ExperiencePoints, HealthPoints, Inventory, ManaPoints, SkillPoints, Stamina, StatPoints,
+        UnionMembership,
+    };
+
+    use super::apply_item_add_ability;
+    use crate::game::{
+        components::{BasicStats, ClanMembership},
+        events::ClanEvent,
+    };
+
+    #[derive(Resource, Clone, Copy)]
+    struct TestEntity(Entity);
+
+    #[test]
+    fn guild_score_add_ability_emits_clan_points_event() {
+        fn system(
+            mut query: Query<(
+                Option<&ClanMembership>,
+                &mut BasicStats,
+                &mut ExperiencePoints,
+                &mut HealthPoints,
+                &mut Inventory,
+                &mut ManaPoints,
+                &mut SkillPoints,
+                &mut Stamina,
+                &mut StatPoints,
+                &mut UnionMembership,
+            )>,
+            mut clan_events: EventWriter<ClanEvent>,
+            entity: Res<TestEntity>,
+        ) {
+            let (
+                clan_membership,
+                mut basic_stats,
+                mut experience_points,
+                mut health_points,
+                mut inventory,
+                mut mana_points,
+                mut skill_points,
+                mut stamina,
+                mut stat_points,
+                mut union_membership,
+            ) = query.get_mut(entity.0).expect("missing test entity");
+            apply_item_add_ability(
+                clan_membership,
+                &mut clan_events,
+                AbilityType::GuildScore,
+                30,
+                None,
+                Some(&mut basic_stats),
+                Some(&mut experience_points),
+                Some(&mut health_points),
+                Some(&mut inventory),
+                Some(&mut mana_points),
+                Some(&mut skill_points),
+                Some(&mut stamina),
+                Some(&mut stat_points),
+                Some(&mut union_membership),
+                None,
+            );
+        }
+
+        let mut app = App::new();
+        app.add_event::<ClanEvent>();
+
+        let clan_entity = app.world.spawn_empty().id();
+        let entity = app
+            .world
+            .spawn((
+                BasicStats::default(),
+                ExperiencePoints::new(0),
+                HealthPoints::new(100),
+                Inventory::default(),
+                ManaPoints::new(50),
+                SkillPoints::new(0),
+                Stamina::new(10),
+                StatPoints::new(0),
+                UnionMembership::default(),
+                ClanMembership::new(clan_entity),
+            ))
+            .id();
+
+        app.insert_resource(TestEntity(entity));
+        app.add_systems(bevy::app::Update, system);
+
+        let mut reader = ManualEventReader::<ClanEvent>::default();
+        app.update();
+
+        let events = app.world.resource::<Events<ClanEvent>>();
+        let mut events = reader.iter(events);
+        match events.next() {
+            Some(ClanEvent::AddPoints {
+                clan_entity: event_clan_entity,
+                points,
+            }) => {
+                assert_eq!(*event_clan_entity, clan_entity);
+                assert_eq!(*points, 30);
+            }
+            _ => panic!("expected ClanEvent::AddPoints"),
+        }
+        assert!(events.next().is_none());
+    }
+
+    #[test]
+    fn guild_score_add_ability_is_noop_without_clan() {
+        fn system(
+            mut query: Query<(
+                Option<&ClanMembership>,
+                &mut BasicStats,
+                &mut ExperiencePoints,
+                &mut HealthPoints,
+                &mut Inventory,
+                &mut ManaPoints,
+                &mut SkillPoints,
+                &mut Stamina,
+                &mut StatPoints,
+                &mut UnionMembership,
+            )>,
+            mut clan_events: EventWriter<ClanEvent>,
+            entity: Res<TestEntity>,
+        ) {
+            let (
+                clan_membership,
+                mut basic_stats,
+                mut experience_points,
+                mut health_points,
+                mut inventory,
+                mut mana_points,
+                mut skill_points,
+                mut stamina,
+                mut stat_points,
+                mut union_membership,
+            ) = query.get_mut(entity.0).expect("missing test entity");
+            apply_item_add_ability(
+                clan_membership,
+                &mut clan_events,
+                AbilityType::GuildScore,
+                1,
+                None,
+                Some(&mut basic_stats),
+                Some(&mut experience_points),
+                Some(&mut health_points),
+                Some(&mut inventory),
+                Some(&mut mana_points),
+                Some(&mut skill_points),
+                Some(&mut stamina),
+                Some(&mut stat_points),
+                Some(&mut union_membership),
+                None,
+            );
+        }
+
+        let mut app = App::new();
+        app.add_event::<ClanEvent>();
+
+        let entity = app
+            .world
+            .spawn((
+                BasicStats::default(),
+                ExperiencePoints::new(0),
+                HealthPoints::new(100),
+                Inventory::default(),
+                ManaPoints::new(50),
+                SkillPoints::new(0),
+                Stamina::new(10),
+                StatPoints::new(0),
+                UnionMembership::default(),
+            ))
+            .id();
+
+        app.insert_resource(TestEntity(entity));
+        app.add_systems(bevy::app::Update, system);
+
+        let mut reader = ManualEventReader::<ClanEvent>::default();
+        app.update();
+
+        let events = app.world.resource::<bevy::ecs::event::Events<ClanEvent>>();
+        assert_eq!(reader.iter(events).count(), 0);
+    }
+
+    #[test]
+    fn non_guildscore_add_ability_uses_existing_stat_path() {
+        fn system(
+            mut query: Query<(
+                Option<&ClanMembership>,
+                &mut BasicStats,
+                &mut ExperiencePoints,
+                &mut HealthPoints,
+                &mut Inventory,
+                &mut ManaPoints,
+                &mut SkillPoints,
+                &mut Stamina,
+                &mut StatPoints,
+                &mut UnionMembership,
+            )>,
+            mut clan_events: EventWriter<ClanEvent>,
+            entity: Res<TestEntity>,
+        ) {
+            let (
+                clan_membership,
+                mut basic_stats,
+                mut experience_points,
+                mut health_points,
+                mut inventory,
+                mut mana_points,
+                mut skill_points,
+                mut stamina,
+                mut stat_points,
+                mut union_membership,
+            ) = query.get_mut(entity.0).expect("missing test entity");
+            apply_item_add_ability(
+                clan_membership,
+                &mut clan_events,
+                AbilityType::Stamina,
+                25,
+                None,
+                Some(&mut basic_stats),
+                Some(&mut experience_points),
+                Some(&mut health_points),
+                Some(&mut inventory),
+                Some(&mut mana_points),
+                Some(&mut skill_points),
+                Some(&mut stamina),
+                Some(&mut stat_points),
+                Some(&mut union_membership),
+                None,
+            );
+        }
+
+        let mut app = App::new();
+        app.add_event::<ClanEvent>();
+
+        let entity = app
+            .world
+            .spawn((
+                BasicStats::default(),
+                ExperiencePoints::new(0),
+                HealthPoints::new(100),
+                Inventory::default(),
+                ManaPoints::new(50),
+                SkillPoints::new(0),
+                Stamina::new(10),
+                StatPoints::new(0),
+                UnionMembership::default(),
+            ))
+            .id();
+
+        app.insert_resource(TestEntity(entity));
+        app.add_systems(bevy::app::Update, system);
+        app.update();
+
+        let stamina = app.world.entity(entity).get::<Stamina>().unwrap();
+        assert_eq!(stamina.stamina, 35);
     }
 }

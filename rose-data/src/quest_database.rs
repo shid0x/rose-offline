@@ -7,6 +7,7 @@ pub use rose_file_readers::QsdTrigger as QuestTrigger;
 
 pub struct QuestData {
     pub id: usize,
+    pub icon_id: u32,
     pub name: &'static str,
     pub description: &'static str,
     pub start_message: &'static str,

@@ -136,6 +136,7 @@ impl CharacterCreator for CharacterCreatorData {
                 rank: 0,
             },
             basic_stats: gender_data.basic_stats.clone(),
+            friends: Vec::new(),
             equipment: Equipment::default(),
             inventory: Inventory::default(),
             level: Level::new(1),

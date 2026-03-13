@@ -140,6 +140,7 @@ pub struct AbilityValues {
     pub npc_store_buy_rate: i32,
     pub npc_store_sell_rate: i32,
     pub save_mana: i32,
+    pub passive_max_summons: i32,
 }
 
 #[allow(dead_code)]
@@ -298,6 +299,14 @@ impl AbilityValues {
 
     pub fn get_save_mana(&self) -> i32 {
         self.save_mana
+    }
+
+    pub fn get_passive_max_summons(&self) -> i32 {
+        self.passive_max_summons
+    }
+
+    pub fn get_max_summon_points(&self) -> u32 {
+        (50 + self.passive_max_summons).max(0) as u32
     }
 
     pub fn get_move_speed(&self, move_mode: &MoveMode) -> f32 {

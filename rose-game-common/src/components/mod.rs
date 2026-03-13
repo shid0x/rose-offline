@@ -15,6 +15,7 @@ mod move_mode;
 mod move_speed;
 mod npc;
 mod quest_state;
+mod recovery_rate_bonus;
 mod skill_list;
 mod skill_points;
 mod stamina;
@@ -27,7 +28,9 @@ pub use ability_values::{AbilityValues, AbilityValuesAdjust, DamageCategory, Dam
 pub use basic_stats::{BasicStatType, BasicStats};
 pub use character_delete_time::CharacterDeleteTime;
 pub use character_info::{CharacterGender, CharacterInfo, CharacterUniqueId};
-pub use clan::{ClanLevel, ClanMark, ClanPoints, ClanUniqueId};
+pub use clan::{
+    get_default_clan_upgrade_points, ClanLevel, ClanMark, ClanPoints, ClanUniqueId, MAX_CLAN_LEVEL,
+};
 pub use equipment::{Equipment, EquipmentItemDatabase, EquipmentItemReference};
 pub use experience_points::ExperiencePoints;
 pub use health_points::HealthPoints;
@@ -43,6 +46,7 @@ pub use move_mode::MoveMode;
 pub use move_speed::MoveSpeed;
 pub use npc::Npc;
 pub use quest_state::{ActiveQuest, QuestState};
+pub use recovery_rate_bonus::RecoveryRateBonus;
 pub use skill_list::{SkillList, SkillPage, SkillSlot};
 pub use skill_points::SkillPoints;
 pub use stamina::{Stamina, MAX_STAMINA};

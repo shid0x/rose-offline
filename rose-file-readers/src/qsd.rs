@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use log::warn;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -571,16 +571,43 @@ impl QsdFile {
     fn read_irose(mut reader: RoseFileReader) -> Result<Self, anyhow::Error> {
         let _file_version = reader.read_u32()?;
         let group_count = reader.read_u32()?;
-        let _filename = reader.read_u16_length_string()?;
+        let filename = reader.read_u16_length_string()?.to_string();
         let mut triggers = HashMap::new();
 
-        for _ in 0..group_count {
+        'groups: for group_index in 0..group_count {
+            if reader.remaining() == 0 {
+                warn!(
+                    "QSD {} declared {} groups but reached EOF after loading {}; accepting truncated file",
+                    filename,
+                    group_count,
+                    group_index
+                );
+                break;
+            }
+
             let trigger_count = reader.read_u32()?;
-            let _group_name = reader.read_u16_length_string()?;
+            let group_name = reader.read_u16_length_string()?.to_string();
             let mut previous_trigger_name = None;
 
-            for _ in 0..trigger_count {
-                let (trigger_name, rewards, conditions, check_next) = read_trigger(&mut reader)?;
+            for trigger_index in 0..trigger_count {
+                if reader.remaining() == 0 {
+                    warn!(
+                        "QSD {} group {} declared {} triggers but reached EOF after loading {}; accepting truncated file",
+                        filename,
+                        group_name,
+                        trigger_count,
+                        trigger_index
+                    );
+                    break 'groups;
+                }
+
+                let (trigger_name, rewards, conditions, check_next) = read_trigger(&mut reader)
+                    .with_context(|| {
+                        format!(
+                            "Failed to parse trigger {} in group {} ({})",
+                            trigger_index, group_name, filename
+                        )
+                    })?;
 
                 {
                     triggers.insert(
@@ -610,6 +637,69 @@ impl QsdFile {
         }
 
         Ok(QsdFile { triggers })
+    }
+}
+
+fn extract_trigger_name_from_bytes(bytes: &[u8]) -> Option<(usize, String)> {
+    let mut best_match: Option<(usize, String)> = None;
+
+    for start in 0..bytes.len() {
+        let byte = bytes[start];
+        if !byte.is_ascii_uppercase() && !byte.is_ascii_digit() {
+            continue;
+        }
+
+        let mut end = start;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            if byte == 0 || !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+                break;
+            }
+            end += 1;
+        }
+
+        if end <= start {
+            continue;
+        }
+
+        let candidate = &bytes[start..end];
+        if !candidate.contains(&b'-') {
+            continue;
+        }
+
+        let candidate = String::from_utf8_lossy(candidate).to_string();
+        match &best_match {
+            Some((_, current)) if current.len() >= candidate.len() => {}
+            _ => best_match = Some((start, candidate)),
+        }
+    }
+
+    best_match
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{RoseFile, RoseFileReader};
+
+    use super::QsdFile;
+
+    fn parse_test_qsd(bytes: &[u8]) -> QsdFile {
+        <QsdFile as RoseFile>::read(RoseFileReader::from(bytes), &Default::default())
+            .expect("failed to parse QSD test asset")
+    }
+
+    #[test]
+    fn test_parse_pvp1301_qsd_with_boundary_eof_compat() {
+        let qsd = parse_test_qsd(include_bytes!("../../../3DDATA/QUESTDATA/PVP13-01.QSD"));
+
+        assert!(qsd.triggers.contains_key("PvP1301-303"));
+    }
+
+    #[test]
+    fn test_parse_pvp10_qsd_with_boundary_eof_compat() {
+        let qsd = parse_test_qsd(include_bytes!("../../../3DDATA/QUESTDATA/PVP10.QSD"));
+
+        assert!(qsd.triggers.contains_key("2858-10"));
     }
 }
 
@@ -2202,10 +2292,25 @@ fn read_trigger(
                 });
             }
             19 => {
-                let zone = reader.read_u16()? as QsdZoneId;
-                let team_number = reader.read_u16()? as QsdTeamNumber;
-                let trigger = reader.read_u16_length_string()?.to_string();
-                reader.set_position(start_position + size_bytes); // padding
+                let payload = reader.read_fixed_length_bytes((size_bytes - 8) as usize)?;
+                let first_value = payload
+                    .get(0..2)
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+                    .ok_or_else(|| anyhow!("Invalid QsdReward::TriggerForZoneTeam payload"))?;
+                let second_value = payload
+                    .get(2..4)
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+                    .ok_or_else(|| anyhow!("Invalid QsdReward::TriggerForZoneTeam payload"))?;
+                let (trigger_start, trigger) = extract_trigger_name_from_bytes(payload)
+                    .ok_or_else(|| anyhow!("Invalid QsdReward::TriggerForZoneTeam trigger"))?;
+
+                // Some PvP QSD files embed the trigger name inside a fixed-width payload instead
+                // of a normal length-prefixed string. Those variants appear to use the source zone.
+                let (zone, team_number) = if trigger_start == 6 {
+                    (first_value as QsdZoneId, second_value as QsdTeamNumber)
+                } else {
+                    (0, first_value as QsdTeamNumber)
+                };
 
                 rewards.push(QsdReward::TriggerForZoneTeam {
                     zone,

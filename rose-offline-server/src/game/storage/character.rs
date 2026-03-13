@@ -2,7 +2,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::PathBuf};
 
-use rose_game_common::components::CharacterGender;
+use rose_game_common::{components::CharacterGender, messages::Friend};
 
 use crate::game::{
     components::{
@@ -17,6 +17,8 @@ use crate::game::{
 pub struct CharacterStorage {
     pub info: CharacterInfo,
     pub basic_stats: BasicStats,
+    #[serde(default)]
+    pub friends: Vec<Friend>,
     pub inventory: Inventory,
     pub equipment: Equipment,
     pub level: Level,

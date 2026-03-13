@@ -51,6 +51,41 @@ impl GameServer {
                     text: String::from(packet.text),
                 })?;
             }
+            Some(ClientPackets::Messenger) => match PacketClientMessenger::try_from(packet)? {
+                PacketClientMessenger::FriendAdd { name } => {
+                    client.client_message_tx.send(ClientMessage::FriendAdd {
+                        name: name.to_string(),
+                    })?;
+                }
+                PacketClientMessenger::FriendAddResponse {
+                    requester_id,
+                    accept,
+                } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::FriendAddResponse {
+                            requester_id,
+                            accept,
+                        })?;
+                }
+                PacketClientMessenger::FriendRemove { friend_id } => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::FriendRemove { friend_id })?;
+                }
+                PacketClientMessenger::FriendList => {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::FriendListRequest)?;
+                }
+            },
+            Some(ClientPackets::MessengerChat) => {
+                let packet = PacketClientMessengerChat::try_from(packet)?;
+                client.client_message_tx.send(ClientMessage::FriendChat {
+                    friend_id: packet.friend_id,
+                    text: packet.text.to_string(),
+                })?;
+            }
             Some(ClientPackets::Move) => {
                 let packet = PacketClientMove::try_from(packet)?;
                 client.client_message_tx.send(ClientMessage::Move {
@@ -373,6 +408,20 @@ impl GameServer {
                 };
                 client.client_message_tx.send(message)?;
             }
+            Some(ClientPackets::CreateItem) => {
+                let packet = PacketClientCreateItem::try_from(packet)?;
+                use rose_data_irose::decode_item_type;
+                if let Some(item_type) = decode_item_type(packet.target_item_type as usize) {
+                    client
+                        .client_message_tx
+                        .send(ClientMessage::CraftCreateItem {
+                            skill_slot: packet.skill_slot,
+                            target_item_type: item_type,
+                            target_item_number: packet.target_item_number as usize,
+                            material_inventory_slots: packet.material_inventory_slots,
+                        })?;
+                }
+            }
             Some(ClientPackets::BankOpen) => {
                 let _ = PacketClientBankOpen::try_from(packet)?;
                 client.client_message_tx.send(ClientMessage::BankOpen)?;
@@ -432,42 +481,33 @@ impl GameServer {
                 PacketClientClanCommand::SetDescription { description } => client
                     .client_message_tx
                     .send(ClientMessage::ClanSetDescription { description })?,
-                PacketClientClanCommand::Invite { name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanInvite { name })?
-                }
-                PacketClientClanCommand::Kick { name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanKick { name })?
-                }
-                PacketClientClanCommand::Promote { name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanPromote { name })?
-                }
-                PacketClientClanCommand::Demote { name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanDemote { name })?
-                }
+                PacketClientClanCommand::Invite { name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanInvite { name })?,
+                PacketClientClanCommand::Kick { name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanKick { name })?,
+                PacketClientClanCommand::Promote { name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanPromote { name })?,
+                PacketClientClanCommand::Demote { name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanDemote { name })?,
+                PacketClientClanCommand::Upgrade { npc_entity_id } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanUpgrade { npc_entity_id })?,
                 PacketClientClanCommand::Leave => {
                     client.client_message_tx.send(ClientMessage::ClanLeave)?
                 }
                 PacketClientClanCommand::Disband => {
                     client.client_message_tx.send(ClientMessage::ClanDisband)?
                 }
-                PacketClientClanCommand::AcceptInvite { inviter_name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanAcceptInvite { inviter_name })?
-                }
-                PacketClientClanCommand::RejectInvite { inviter_name } => {
-                    client
-                        .client_message_tx
-                        .send(ClientMessage::ClanRejectInvite { inviter_name })?
-                }
+                PacketClientClanCommand::AcceptInvite { inviter_name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanAcceptInvite { inviter_name })?,
+                PacketClientClanCommand::RejectInvite { inviter_name } => client
+                    .client_message_tx
+                    .send(ClientMessage::ClanRejectInvite { inviter_name })?,
             },
             _ => warn!(
                 "[GS] Unhandled packet [{:#03X}] {:02x?}",
@@ -547,6 +587,7 @@ impl GameServer {
                 entity_id,
                 experience_points,
                 team,
+                global_flags,
                 health_points,
                 mana_points,
                 world_ticks,
@@ -561,6 +602,7 @@ impl GameServer {
                         entity_id,
                         experience_points,
                         team,
+                        global_flags,
                         health_points,
                         mana_points,
                         world_ticks,
@@ -708,6 +750,70 @@ impl GameServer {
                 client
                     .connection
                     .write_packet(Packet::from(&PacketServerWhisper { from, text }))
+                    .await?;
+            }
+            ServerMessage::FriendList { ref friends } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessenger::FriendList {
+                        friends: friends.clone(),
+                    }))
+                    .await?;
+            }
+            ServerMessage::FriendAddRequest {
+                requester_id,
+                ref name,
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessenger::FriendAddRequest {
+                        requester_id,
+                        name,
+                    }))
+                    .await?;
+            }
+            ServerMessage::FriendAdded { ref friend } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessenger::FriendAdded {
+                        friend: friend.clone(),
+                    }))
+                    .await?;
+            }
+            ServerMessage::FriendAddRejected { ref name } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessenger::FriendAddRejected {
+                        name,
+                    }))
+                    .await?;
+            }
+            ServerMessage::FriendAddTargetNotFound { ref name } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(
+                        &PacketServerMessenger::FriendAddTargetNotFound { name },
+                    ))
+                    .await?;
+            }
+            ServerMessage::FriendRemoved { .. } => {}
+            ServerMessage::FriendStatusChanged { friend_id, status } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessenger::FriendStatusChanged {
+                        friend_id,
+                        status,
+                    }))
+                    .await?;
+            }
+            ServerMessage::FriendChat {
+                friend_id,
+                ref text,
+                ..
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerMessengerChat { friend_id, text }))
                     .await?;
             }
             ServerMessage::SpawnEntityCharacter { data } => {
@@ -869,6 +975,27 @@ impl GameServer {
                         entity_id,
                         run_speed,
                         passive_attack_speed,
+                    }))
+                    .await?;
+            }
+            ServerMessage::UpdateSummonPoints {
+                used_points,
+                max_points,
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerUpdateSummonPoints {
+                        used_points,
+                        max_points,
+                    }))
+                    .await?;
+            }
+            ServerMessage::UpdateRecoveryRates { hp_bonus, mp_bonus } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerUpdateRecoveryRates {
+                        hp_bonus,
+                        mp_bonus,
                     }))
                     .await?;
             }
@@ -1481,6 +1608,20 @@ impl GameServer {
                     }))
                     .await?;
             }
+            ServerMessage::PartyLevelXp {
+                level,
+                xp,
+                is_level_up,
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerPartyLevelXp {
+                        level,
+                        xp,
+                        is_level_up,
+                    }))
+                    .await?;
+            }
             ServerMessage::ChangeNpcId { entity_id, npc_id } => {
                 client
                     .connection
@@ -1521,6 +1662,58 @@ impl GameServer {
                     .connection
                     .write_packet(Packet::from(&PacketServerCraftItem::InsertGemFailed {
                         error,
+                    }))
+                    .await?;
+            }
+            ServerMessage::CraftCreateItemSuccess {
+                inventory_slot,
+                item,
+            } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerCreateItemResult::Success {
+                        inventory_slot,
+                        item,
+                    }))
+                    .await?;
+            }
+            ServerMessage::CraftCreateItemError { error } => {
+                use rose_game_common::messages::server::CraftCreateItemError;
+                let error_code = match error {
+                    CraftCreateItemError::Failed => 1,
+                    CraftCreateItemError::InvalidCondition => 2,
+                    CraftCreateItemError::NeedItem => 3,
+                    CraftCreateItemError::InvalidItem => 4,
+                    CraftCreateItemError::NeedSkillLevel => 5,
+                };
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerCreateItemResult::Failed {
+                        error: error_code,
+                    }))
+                    .await?;
+            }
+            ServerMessage::CraftUpgradeSuccess { update_items } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerCraftItem::UpgradeSuccess {
+                        items: update_items,
+                    }))
+                    .await?;
+            }
+            ServerMessage::CraftUpgradeFailed { update_items } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerCraftItem::UpgradeFailed {
+                        items: update_items,
+                    }))
+                    .await?;
+            }
+            ServerMessage::CraftDisassembleSuccess { update_items } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerCraftItem::DisassembleSuccess {
+                        items: update_items,
                     }))
                     .await?;
             }
@@ -1706,28 +1899,36 @@ impl GameServer {
                     }))
                     .await?;
             }
+            ServerMessage::ClanUpgradeResult { result } => {
+                client
+                    .connection
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanUpgradeResult {
+                        result,
+                    }))
+                    .await?;
+            }
             ServerMessage::ClanMemberJoined { name } => {
                 client
                     .connection
-                    .write_packet(Packet::from(
-                        &PacketServerClanCommand::ClanMemberJoined { name },
-                    ))
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanMemberJoined {
+                        name,
+                    }))
                     .await?;
             }
             ServerMessage::ClanMemberLeft { name } => {
                 client
                     .connection
-                    .write_packet(Packet::from(
-                        &PacketServerClanCommand::ClanMemberLeft { name },
-                    ))
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanMemberLeft {
+                        name,
+                    }))
                     .await?;
             }
             ServerMessage::ClanMemberKicked { name } => {
                 client
                     .connection
-                    .write_packet(Packet::from(
-                        &PacketServerClanCommand::ClanMemberKicked { name },
-                    ))
+                    .write_packet(Packet::from(&PacketServerClanCommand::ClanMemberKicked {
+                        name,
+                    }))
                     .await?;
             }
             ServerMessage::ClanKicked => {

@@ -12,6 +12,7 @@ use rand::Rng;
 use crate::game::{
     bundles::{skill_can_target_entity, skill_can_use, SkillCasterBundle, SkillTargetBundle},
     components::{Command, CommandData, NextCommand, SkillList},
+    resources::ZoneList,
     GameData,
 };
 
@@ -38,6 +39,7 @@ pub fn score_should_use_attack_skill(
     >,
     query_target: Query<SkillTargetBundle>,
     game_data: Res<GameData>,
+    zone_list: Res<ZoneList>,
     time: Res<Time>,
 ) {
     let Some(now) = time.last_update() else {
@@ -86,7 +88,13 @@ pub fn score_should_use_attack_skill(
         for skill_id in active_skill_page.skills.iter().filter_map(|x| x.as_ref()) {
             if let Some(skill_data) = game_data.skills.get_skill(*skill_id) {
                 if skill_can_use(now, &game_data, &skill_caster, skill_data)
-                    && skill_can_target_entity(&skill_caster, &skill_target, skill_data)
+                    && skill_can_target_entity(
+                        &game_data,
+                        &zone_list,
+                        &skill_caster,
+                        &skill_target,
+                        skill_data,
+                    )
                 {
                     score.set(scorer.score);
                     break;
@@ -103,6 +111,7 @@ pub fn action_use_attack_skill(
     query_target: Query<SkillTargetBundle>,
     query_command: Query<(&Command, &NextCommand)>,
     game_data: Res<GameData>,
+    zone_list: Res<ZoneList>,
     time: Res<Time>,
 ) {
     let Some(now) = time.last_update() else {
@@ -133,7 +142,13 @@ pub fn action_use_attack_skill(
                 for skill_id in active_skill_page.skills.iter().filter_map(|x| x.as_ref()) {
                     if let Some(skill_data) = game_data.skills.get_skill(*skill_id) {
                         if skill_can_use(now, &game_data, &skill_caster, skill_data)
-                            && skill_can_target_entity(&skill_caster, &skill_target, skill_data)
+                            && skill_can_target_entity(
+                                &game_data,
+                                &zone_list,
+                                &skill_caster,
+                                &skill_target,
+                                skill_data,
+                            )
                         {
                             commands.entity(entity).insert(
                                 NextCommand::with_cast_skill_target_entity(

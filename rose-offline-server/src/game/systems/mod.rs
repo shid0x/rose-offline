@@ -2,6 +2,7 @@ mod ability_values_changed_system;
 mod ability_values_update_character_system;
 mod ability_values_update_npc_system;
 mod bank_system;
+mod bonfire_aura_system;
 mod chat_commands_system;
 mod clan_system;
 mod client_entity_visibility_system;
@@ -31,6 +32,7 @@ mod skill_effect_system;
 mod startup_clans_system;
 mod startup_zones_system;
 mod status_effect_system;
+mod summon_points_system;
 mod update_motion_data_system;
 mod update_position_system;
 mod use_ammo_system;
@@ -43,6 +45,7 @@ pub use ability_values_changed_system::ability_values_changed_system;
 pub use ability_values_update_character_system::ability_values_update_character_system;
 pub use ability_values_update_npc_system::ability_values_update_npc_system;
 pub use bank_system::bank_system;
+pub use bonfire_aura_system::bonfire_aura_system;
 pub use chat_commands_system::chat_commands_system;
 pub use clan_system::clan_system;
 pub use client_entity_visibility_system::client_entity_visibility_system;
@@ -77,6 +80,10 @@ pub use skill_effect_system::skill_effect_system;
 pub use startup_clans_system::startup_clans_system;
 pub use startup_zones_system::startup_zones_system;
 pub use status_effect_system::status_effect_system;
+pub use summon_points_system::{
+    summon_points_dead_cleanup_system, summon_points_owner_cleanup_system,
+    summon_points_owner_reset_system, summon_points_sync_system,
+};
 pub use update_motion_data_system::{
     update_character_motion_data_system, update_npc_motion_data_system,
 };

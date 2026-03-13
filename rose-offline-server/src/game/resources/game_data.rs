@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rose_data::{
     AiDatabase, CharacterMotionDatabase, DataDecoder, ItemDatabase, JobClassDatabase, NpcDatabase,
-    QuestDatabase, SkillDatabase, StatusEffectDatabase, StringDatabase, WarpGateDatabase,
-    ZoneDatabase,
+    ProductDatabase, QuestDatabase, SkillDatabase, StatusEffectDatabase, StringDatabase,
+    WarpGateDatabase, ZoneDatabase,
 };
 use rose_game_common::data::{AbilityValueCalculator, DropTable};
 
@@ -21,6 +21,7 @@ pub struct GameData {
     pub job_class: Arc<JobClassDatabase>,
     pub motions: Arc<CharacterMotionDatabase>,
     pub npcs: Arc<NpcDatabase>,
+    pub products: Arc<ProductDatabase>,
     pub quests: Arc<QuestDatabase>,
     pub skills: Arc<SkillDatabase>,
     pub status_effects: Arc<StatusEffectDatabase>,

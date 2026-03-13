@@ -2,22 +2,28 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use bevy::{
     ecs::query::WorldQuery,
-    prelude::{Changed, Commands, Entity, EventReader, Query, ResMut},
+    math::Vec3Swizzles,
+    prelude::{Changed, Commands, Entity, EventReader, Query, Res, ResMut, With},
 };
 
 use rose_data::{ClanMemberPosition, QuestTriggerHash};
 use rose_game_common::{
-    components::{ClanLevel, ClanPoints, ClanUniqueId},
-    messages::server::{ClanCreateError, ClanInviteResponse, ClanMemberInfo, ServerMessage},
+    components::{ClanLevel, ClanPoints, ClanUniqueId, MAX_CLAN_LEVEL},
+    messages::{
+        server::{
+            ClanCreateError, ClanInviteResponse, ClanMemberInfo, ClanUpgradeResult, ServerMessage,
+        },
+        ClientEntityId,
+    },
 };
 
 use crate::game::{
     components::{
         CharacterInfo, Clan, ClanMember, ClanMembership, ClientEntity, GameClient, Inventory,
-        Level, Money,
+        Level, Money, Npc, Position,
     },
     events::ClanEvent,
-    resources::ServerMessages,
+    resources::{GameConfig, ServerMessages},
     storage::clan::{ClanStorage, ClanStorageMember},
 };
 
@@ -38,6 +44,7 @@ pub struct MemberQuery<'w> {
     character_info: &'w CharacterInfo,
     clan_membership: &'w ClanMembership,
     level: &'w Level,
+    position: &'w Position,
     game_client: Option<&'w GameClient>,
     client_entity: Option<&'w ClientEntity>,
 }
@@ -69,6 +76,71 @@ fn send_update_clan_info(clan: &Clan, query_member: &Query<MemberQuery>) {
             }
         }
     }
+}
+
+fn send_clan_upgrade_result(member: &MemberQueryItem, result: ClanUpgradeResult) {
+    if let Some(game_client) = member.game_client {
+        game_client
+            .server_message_tx
+            .send(ServerMessage::ClanUpgradeResult { result })
+            .ok();
+    }
+}
+
+fn send_character_update_clan_for_online_members(
+    clan: &Clan,
+    query_member: &Query<MemberQuery>,
+    server_messages: &mut ServerMessages,
+) {
+    for clan_member in clan.members.iter() {
+        let &ClanMember::Online {
+            entity: clan_member_entity,
+            position,
+            ..
+        } = clan_member
+        else {
+            continue;
+        };
+
+        let Ok(online_member) = query_member.get(clan_member_entity) else {
+            continue;
+        };
+        let (Some(game_client), Some(client_entity)) =
+            (online_member.game_client, online_member.client_entity)
+        else {
+            continue;
+        };
+
+        let update_message = ServerMessage::CharacterUpdateClan {
+            client_entity_id: client_entity.id,
+            id: clan.unique_id,
+            name: clan.name.clone(),
+            mark: clan.mark,
+            level: clan.level,
+            position,
+        };
+
+        game_client
+            .server_message_tx
+            .send(update_message.clone())
+            .ok();
+        server_messages.send_entity_message(client_entity, update_message);
+    }
+}
+
+fn find_npc_entity(
+    query_npc: &Query<(Entity, &ClientEntity, &Position), With<Npc>>,
+    npc_entity_id: ClientEntityId,
+) -> Option<(Entity, ClientEntityId, Position)> {
+    query_npc
+        .iter()
+        .find_map(|(entity, client_entity, position)| {
+            (client_entity.id == npc_entity_id).then_some((
+                entity,
+                client_entity.id,
+                position.clone(),
+            ))
+        })
 }
 
 fn save_clan(clan: &Clan, query_member: &Query<MemberQuery>) {
@@ -269,8 +341,10 @@ pub fn clan_system(
     mut clan_events: EventReader<ClanEvent>,
     query_member_connected: Query<MemberQuery, Changed<ClanMembership>>,
     query_member: Query<MemberQuery>,
+    query_npc: Query<(Entity, &ClientEntity, &Position), With<Npc>>,
     mut query_creator: Query<CreatorQuery>,
     mut query_clans: Query<(Entity, &mut Clan)>,
+    game_config: Res<GameConfig>,
     mut server_messages: ResMut<ServerMessages>,
 ) {
     for event in clan_events.iter() {
@@ -283,7 +357,10 @@ pub fn clan_system(
                 skip_requirements,
             } => {
                 let Ok(mut creator) = query_creator.get_mut(*creator_entity) else {
-                    log::error!("Clan create: could not find creator entity {:?}", creator_entity);
+                    log::error!(
+                        "Clan create: could not find creator entity {:?}",
+                        creator_entity
+                    );
                     continue;
                 };
 
@@ -364,7 +441,11 @@ pub fn clan_system(
                     creator.inventory.try_add_money(money).ok();
                     continue;
                 }
-                log::info!("Clan '{}' created successfully by {}", name, creator.character_info.name);
+                log::info!(
+                    "Clan '{}' created successfully by {}",
+                    name,
+                    creator.character_info.name
+                );
 
                 // Create clan entity
                 let unique_id =
@@ -392,6 +473,15 @@ pub fn clan_system(
                 commands
                     .entity(*creator_entity)
                     .insert(ClanMembership::new(clan_entity));
+
+                if let Some(game_client) = creator.game_client {
+                    game_client
+                        .server_message_tx
+                        .send(ServerMessage::UpdateMoney {
+                            money: creator.inventory.money,
+                        })
+                        .ok();
+                }
 
                 // Update clan to nearby entities
                 server_messages.send_entity_message(
@@ -521,7 +611,10 @@ pub fn clan_system(
                 }
 
                 let Some(inviter_entity) = inviter_entity else {
-                    log::warn!("[ClanAcceptInvite] Could not find inviter '{}'", inviter_name);
+                    log::warn!(
+                        "[ClanAcceptInvite] Could not find inviter '{}'",
+                        inviter_name
+                    );
                     continue;
                 };
 
@@ -575,8 +668,12 @@ pub fn clan_system(
                 });
 
                 let invited_name = invited.character_info.name.clone();
-                log::info!("[ClanAcceptInvite] Successfully added '{}' to clan '{}' (now {} members)",
-                    &invited_name, &clan.name, clan.members.len());
+                log::info!(
+                    "[ClanAcceptInvite] Successfully added '{}' to clan '{}' (now {} members)",
+                    &invited_name,
+                    &clan.name,
+                    clan.members.len()
+                );
 
                 // Send joined notification to all existing online members
                 for member in clan.members.iter() {
@@ -680,11 +777,9 @@ pub fn clan_system(
                     .members
                     .iter()
                     .find(|m| match m {
-                        ClanMember::Online { entity, .. } => {
-                            query_member
-                                .get(*entity)
-                                .map_or(false, |q| q.character_info.name == *kick_name)
-                        }
+                        ClanMember::Online { entity, .. } => query_member
+                            .get(*entity)
+                            .map_or(false, |q| q.character_info.name == *kick_name),
                         ClanMember::Offline { name, .. } => name == kick_name,
                     })
                     .map(|m| m.position());
@@ -765,8 +860,9 @@ pub fn clan_system(
                     continue;
                 };
 
-                let Some(changer_position) =
-                    clan.find_online_member(*changer_entity).map(|member| member.position())
+                let Some(changer_position) = clan
+                    .find_online_member(*changer_entity)
+                    .map(|member| member.position())
                 else {
                     continue;
                 };
@@ -854,8 +950,9 @@ pub fn clan_system(
                     continue;
                 };
 
-                let Some(changer_position) =
-                    clan.find_online_member(*changer_entity).map(|member| member.position())
+                let Some(changer_position) = clan
+                    .find_online_member(*changer_entity)
+                    .map(|member| member.position())
                 else {
                     continue;
                 };
@@ -927,6 +1024,82 @@ pub fn clan_system(
                     }
                 }
             }
+            ClanEvent::Upgrade {
+                requester_entity,
+                npc_entity_id,
+            } => {
+                let Ok(requester) = query_member.get(*requester_entity) else {
+                    continue;
+                };
+
+                let Some(clan_entity_id) = requester.clan_membership.clan() else {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::NoClan);
+                    continue;
+                };
+
+                let Some((_, _, npc_position)) = find_npc_entity(&query_npc, *npc_entity_id) else {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::InvalidNpc);
+                    continue;
+                };
+
+                if requester.position.zone_id != npc_position.zone_id
+                    || requester
+                        .position
+                        .position
+                        .xy()
+                        .distance(npc_position.position.xy())
+                        > 6000.0
+                {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::NpcTooFar);
+                    continue;
+                }
+
+                let Ok((_, mut clan)) = query_clans.get_mut(clan_entity_id) else {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::NoClan);
+                    continue;
+                };
+
+                let is_master = clan
+                    .find_online_member(*requester_entity)
+                    .map_or(false, |member| {
+                        member.position() == ClanMemberPosition::Master
+                    });
+                if !is_master {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::NoPermission);
+                    continue;
+                }
+
+                if clan.level.get() >= MAX_CLAN_LEVEL {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::MaxLevel);
+                    continue;
+                }
+
+                let next_level = clan.level.get() + 1;
+                let Some(required_points) = game_config.clan_upgrade_points_required(next_level)
+                else {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::MaxLevel);
+                    continue;
+                };
+                if clan.points.0 < required_points.0 {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::InsufficientPoints);
+                    continue;
+                }
+
+                let Some(next_level) = ClanLevel::new(next_level) else {
+                    send_clan_upgrade_result(&requester, ClanUpgradeResult::MaxLevel);
+                    continue;
+                };
+
+                clan.level = next_level;
+                send_update_clan_info(&clan, &query_member);
+                send_character_update_clan_for_online_members(
+                    &clan,
+                    &query_member,
+                    &mut server_messages,
+                );
+                save_clan(&clan, &query_member);
+                send_clan_upgrade_result(&requester, ClanUpgradeResult::Success);
+            }
             ClanEvent::Leave { leaver_entity } => {
                 let Ok(leaver) = query_member.get(*leaver_entity) else {
                     continue;
@@ -957,9 +1130,7 @@ pub fn clan_system(
                     .retain(|member| !matches!(member, ClanMember::Online { entity, .. } if *entity == *leaver_entity));
 
                 // Clear clan membership
-                commands
-                    .entity(*leaver_entity)
-                    .insert(ClanMembership(None));
+                commands.entity(*leaver_entity).insert(ClanMembership(None));
 
                 // If no members remain, delete the clan
                 if clan.members.is_empty() {
@@ -967,7 +1138,11 @@ pub fn clan_system(
                     commands.entity(clan_entity_id).despawn();
 
                     if let Err(error) = ClanStorage::delete(&clan_name) {
-                        log::error!("Failed to delete clan storage for {}: {:?}", clan_name, error);
+                        log::error!(
+                            "Failed to delete clan storage for {}: {:?}",
+                            clan_name,
+                            error
+                        );
                     }
 
                     // Notify the leaver that the clan is disbanded
@@ -1044,9 +1219,7 @@ pub fn clan_system(
                         continue;
                     };
 
-                    commands
-                        .entity(member_entity)
-                        .insert(ClanMembership(None));
+                    commands.entity(member_entity).insert(ClanMembership(None));
 
                     if let Ok(online_member) = query_member.get(member_entity) {
                         if let Some(game_client) = online_member.game_client {
@@ -1067,7 +1240,11 @@ pub fn clan_system(
 
                 // Delete storage file
                 if let Err(error) = ClanStorage::delete(&clan_name) {
-                    log::error!("Failed to delete clan storage for {}: {:?}", clan_name, error);
+                    log::error!(
+                        "Failed to delete clan storage for {}: {:?}",
+                        clan_name,
+                        error
+                    );
                 }
             }
             &ClanEvent::MemberDisconnect {
@@ -1155,9 +1332,11 @@ pub fn clan_system(
                     continue;
                 };
 
-                let is_master = clan.find_online_member(*updater_entity).map_or(false, |member| {
-                    matches!(member.position(), ClanMemberPosition::Master)
-                });
+                let is_master = clan
+                    .find_online_member(*updater_entity)
+                    .map_or(false, |member| {
+                        matches!(member.position(), ClanMemberPosition::Master)
+                    });
 
                 if !is_master {
                     continue;
@@ -1178,6 +1357,11 @@ pub fn clan_system(
                     {
                         clan.level = ClanLevel(level);
                         send_update_clan_info(&clan, &query_member);
+                        send_character_update_clan_for_online_members(
+                            &clan,
+                            &query_member,
+                            &mut server_messages,
+                        );
                         save_clan(&clan, &query_member);
                     }
                 }
@@ -1186,6 +1370,11 @@ pub fn clan_system(
                 if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     clan.level = level;
                     send_update_clan_info(&clan, &query_member);
+                    send_character_update_clan_for_online_members(
+                        &clan,
+                        &query_member,
+                        &mut server_messages,
+                    );
                     save_clan(&clan, &query_member);
                 }
             }
@@ -1316,5 +1505,376 @@ pub fn clan_system(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Once,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use bevy::{
+        math::Vec3,
+        prelude::{App, Update},
+    };
+    use crossbeam_channel::unbounded as crossbeam_unbounded;
+    use rose_game_common::{
+        components::{get_default_clan_upgrade_points, CharacterGender, Money},
+        messages::{
+            server::{ClanUpgradeResult, ServerMessage},
+            ClientEntityId,
+        },
+    };
+    use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
+
+    use super::clan_system;
+    use crate::game::{
+        components::{
+            CharacterInfo, Clan, ClanMembership, ClientEntity, ClientEntityType, GameClient,
+            Inventory, Level, Npc, Position,
+        },
+        events::ClanEvent,
+        resources::{GameConfig, ServerMessages},
+        storage::clan::ClanStorage,
+    };
+
+    static TEST_STORAGE_INIT: Once = Once::new();
+
+    fn create_test_app() -> App {
+        let mut app = App::new();
+        app.add_event::<ClanEvent>();
+        app.insert_resource(GameConfig::default());
+        app.insert_resource(ServerMessages::default());
+        app.add_systems(Update, clan_system);
+        app
+    }
+
+    fn setup_test_storage_dir() {
+        TEST_STORAGE_INIT.call_once(|| {
+            let storage_dir = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join("test-clan-system-data");
+            std::fs::create_dir_all(&storage_dir).unwrap();
+            std::env::set_var("ROSE_OFFLINE_TEST_DATA_DIR", storage_dir);
+        });
+    }
+
+    fn unique_clan_name(prefix: &str) -> String {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{}_{}", prefix, suffix)
+    }
+
+    fn test_character_info(name: &str) -> CharacterInfo {
+        CharacterInfo {
+            name: name.to_string(),
+            gender: CharacterGender::Male,
+            race: 0,
+            birth_stone: 0,
+            job: 111,
+            face: 0,
+            hair: 0,
+            rank: 0,
+            fame: 0,
+            fame_b: 0,
+            fame_g: 0,
+            revive_zone_id: rose_data::ZoneId::new(1).unwrap(),
+            revive_position: Vec3::ZERO,
+            unique_id: 1,
+        }
+    }
+
+    fn spawn_creator(
+        app: &mut App,
+        name: &str,
+        money: Money,
+    ) -> (bevy::prelude::Entity, UnboundedReceiver<ServerMessage>) {
+        let (client_message_tx, client_message_rx) = crossbeam_unbounded();
+        drop(client_message_tx);
+        let (server_message_tx, server_message_rx) = unbounded_channel();
+
+        let mut inventory = Inventory::default();
+        inventory.money = money;
+
+        let creator = app
+            .world
+            .spawn((
+                ClientEntity::new(
+                    ClientEntityType::Character,
+                    ClientEntityId(1),
+                    rose_data::ZoneId::new(1).unwrap(),
+                ),
+                test_character_info(name),
+                Position::new(Vec3::ZERO, rose_data::ZoneId::new(1).unwrap()),
+                Level::new(30),
+                inventory,
+                GameClient::new(client_message_rx, server_message_tx),
+                ClanMembership::default(),
+            ))
+            .id();
+
+        (creator, server_message_rx)
+    }
+
+    #[test]
+    fn clan_create_updates_creator_money_after_success() {
+        setup_test_storage_dir();
+        let clan_name = unique_clan_name("test_clan_create_success");
+        ClanStorage::delete(&clan_name).ok();
+
+        let mut app = create_test_app();
+        let (creator, mut server_message_rx) =
+            spawn_creator(&mut app, "CreatorSuccess", Money(1_500_000));
+
+        app.world.send_event(ClanEvent::Create {
+            creator,
+            name: clan_name.clone(),
+            description: "Integration test clan".to_string(),
+            mark: rose_game_common::components::ClanMark::Premade {
+                background: std::num::NonZeroU16::new(1).unwrap(),
+                foreground: std::num::NonZeroU16::new(1).unwrap(),
+            },
+            skip_requirements: false,
+        });
+        app.update();
+
+        assert_eq!(
+            app.world.get::<Inventory>(creator).unwrap().money,
+            Money(500_000)
+        );
+
+        let clan_membership = app.world.get::<ClanMembership>(creator).unwrap();
+        let clan_entity = clan_membership.clan().unwrap();
+        let clan = app.world.get::<Clan>(clan_entity).unwrap();
+        assert_eq!(clan.name, clan_name);
+
+        match server_message_rx.try_recv() {
+            Ok(ServerMessage::UpdateMoney { money }) => {
+                assert_eq!(money, Money(500_000));
+            }
+            other => panic!(
+                "expected UpdateMoney after clan create success, got {:?}",
+                other
+            ),
+        }
+        assert!(matches!(
+            server_message_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        ClanStorage::delete(&clan_name).ok();
+    }
+
+    #[test]
+    fn clan_create_with_insufficient_money_keeps_balance_and_sends_error() {
+        setup_test_storage_dir();
+        let clan_name = unique_clan_name("test_clan_create_failure");
+        ClanStorage::delete(&clan_name).ok();
+
+        let mut app = create_test_app();
+        let (creator, mut server_message_rx) =
+            spawn_creator(&mut app, "CreatorFailure", Money(999_999));
+
+        app.world.send_event(ClanEvent::Create {
+            creator,
+            name: clan_name.clone(),
+            description: "Should not be created".to_string(),
+            mark: rose_game_common::components::ClanMark::Premade {
+                background: std::num::NonZeroU16::new(1).unwrap(),
+                foreground: std::num::NonZeroU16::new(1).unwrap(),
+            },
+            skip_requirements: false,
+        });
+        app.update();
+
+        assert_eq!(
+            app.world.get::<Inventory>(creator).unwrap().money,
+            Money(999_999)
+        );
+        assert!(app
+            .world
+            .get::<ClanMembership>(creator)
+            .unwrap()
+            .clan()
+            .is_none());
+        assert!(!ClanStorage::exists(&clan_name));
+
+        match server_message_rx.try_recv() {
+            Ok(ServerMessage::ClanCreateError { error }) => {
+                assert!(matches!(
+                    error,
+                    rose_game_common::messages::server::ClanCreateError::UnmetCondition
+                ));
+            }
+            other => panic!(
+                "expected ClanCreateError after insufficient money, got {:?}",
+                other
+            ),
+        }
+        assert!(matches!(
+            server_message_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    fn spawn_npc(
+        app: &mut App,
+        entity_id: ClientEntityId,
+        position: Vec3,
+    ) -> bevy::prelude::Entity {
+        app.world
+            .spawn((
+                ClientEntity::new(
+                    ClientEntityType::Npc,
+                    entity_id,
+                    rose_data::ZoneId::new(1).unwrap(),
+                ),
+                Position::new(position, rose_data::ZoneId::new(1).unwrap()),
+                Npc::new(rose_data::NpcId::new(1).unwrap(), 0),
+            ))
+            .id()
+    }
+
+    fn drain_server_messages(
+        server_message_rx: &mut UnboundedReceiver<ServerMessage>,
+    ) -> Vec<ServerMessage> {
+        let mut messages = Vec::new();
+        loop {
+            match server_message_rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        messages
+    }
+
+    #[test]
+    fn clan_upgrade_succeeds_at_required_points_threshold() {
+        setup_test_storage_dir();
+        let clan_name = unique_clan_name("test_clan_upgrade_success");
+        ClanStorage::delete(&clan_name).ok();
+
+        let mut app = create_test_app();
+        let (creator, mut server_message_rx) =
+            spawn_creator(&mut app, "UpgradeSuccess", Money(1_500_000));
+
+        app.world.send_event(ClanEvent::Create {
+            creator,
+            name: clan_name.clone(),
+            description: "Upgrade success test".to_string(),
+            mark: rose_game_common::components::ClanMark::Premade {
+                background: std::num::NonZeroU16::new(1).unwrap(),
+                foreground: std::num::NonZeroU16::new(1).unwrap(),
+            },
+            skip_requirements: true,
+        });
+        app.update();
+
+        let clan_entity = app
+            .world
+            .get::<ClanMembership>(creator)
+            .unwrap()
+            .clan()
+            .unwrap();
+        let required_points = get_default_clan_upgrade_points(2).unwrap();
+        app.world.get_mut::<Clan>(clan_entity).unwrap().points = required_points;
+
+        let npc_entity_id = ClientEntityId(700);
+        spawn_npc(&mut app, npc_entity_id, Vec3::new(5.0, 0.0, 0.0));
+        drain_server_messages(&mut server_message_rx);
+
+        app.world.send_event(ClanEvent::Upgrade {
+            requester_entity: creator,
+            npc_entity_id,
+        });
+        app.update();
+
+        let clan = app.world.get::<Clan>(clan_entity).unwrap();
+        assert_eq!(clan.level.get(), 2);
+        assert_eq!(clan.points.0, required_points.0);
+
+        let messages = drain_server_messages(&mut server_message_rx);
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ClanUpgradeResult {
+                result: ClanUpgradeResult::Success
+            }
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ClanUpdateInfo { level, .. } if level.get() == 2
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::CharacterUpdateClan { level, .. } if level.get() == 2
+        )));
+
+        ClanStorage::delete(&clan_name).ok();
+    }
+
+    #[test]
+    fn clan_upgrade_rejects_when_points_are_insufficient() {
+        setup_test_storage_dir();
+        let clan_name = unique_clan_name("test_clan_upgrade_insufficient");
+        ClanStorage::delete(&clan_name).ok();
+
+        let mut app = create_test_app();
+        let (creator, mut server_message_rx) =
+            spawn_creator(&mut app, "UpgradeFailure", Money(1_500_000));
+
+        app.world.send_event(ClanEvent::Create {
+            creator,
+            name: clan_name.clone(),
+            description: "Upgrade failure test".to_string(),
+            mark: rose_game_common::components::ClanMark::Premade {
+                background: std::num::NonZeroU16::new(1).unwrap(),
+                foreground: std::num::NonZeroU16::new(1).unwrap(),
+            },
+            skip_requirements: true,
+        });
+        app.update();
+
+        let clan_entity = app
+            .world
+            .get::<ClanMembership>(creator)
+            .unwrap()
+            .clan()
+            .unwrap();
+        let required_points = get_default_clan_upgrade_points(2).unwrap();
+        app.world.get_mut::<Clan>(clan_entity).unwrap().points =
+            rose_game_common::components::ClanPoints(required_points.0 - 1);
+
+        let npc_entity_id = ClientEntityId(701);
+        spawn_npc(&mut app, npc_entity_id, Vec3::new(5.0, 0.0, 0.0));
+        drain_server_messages(&mut server_message_rx);
+
+        app.world.send_event(ClanEvent::Upgrade {
+            requester_entity: creator,
+            npc_entity_id,
+        });
+        app.update();
+
+        let clan = app.world.get::<Clan>(clan_entity).unwrap();
+        assert_eq!(clan.level.get(), 1);
+
+        let messages = drain_server_messages(&mut server_message_rx);
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ClanUpgradeResult {
+                result: ClanUpgradeResult::InsufficientPoints
+            }
+        )));
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::ClanUpdateInfo { level, .. } if level.get() > 1
+        )));
+
+        ClanStorage::delete(&clan_name).ok();
     }
 }

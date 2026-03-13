@@ -10,14 +10,15 @@ use bevy::{
 };
 
 use rose_data::{
-    AmmoIndex, EquipmentIndex, ItemClass, SkillActionMode, SkillId, SkillType, VehiclePartIndex,
+    AmmoIndex, EquipmentIndex, ItemClass, SkillActionMode, SkillData, SkillId, SkillType,
+    VehiclePartIndex,
 };
 use rose_game_common::components::{CharacterGender, CharacterInfo};
 
 use crate::game::{
     bundles::{
         skill_can_target_entity, skill_can_target_position, skill_can_target_self, skill_can_use,
-        SkillCasterBundle, SkillTargetBundle,
+        SkillCasterBundle, SkillCasterBundleItem, SkillTargetBundle,
     },
     components::{
         AbilityValues, ClientEntity, ClientEntitySector, ClientEntityType, Command,
@@ -28,8 +29,9 @@ use crate::game::{
     events::{
         DamageEvent, ItemLifeEvent, PickupItemEvent, SkillEvent, SkillEventTarget, UseAmmoEvent,
     },
-    messages::server::ServerMessage,
-    resources::{GameData, ServerMessages},
+    messages::server::{CancelCastingSkillReason, ServerMessage},
+    pvp::can_character_attack_character,
+    resources::{GameData, ServerMessages, ZoneList},
 };
 
 const NPC_MOVE_TO_DISTANCE: f32 = 250.0;
@@ -116,10 +118,13 @@ fn is_valid_move_target(target: &CommandMoveTargetQueryItem, position: &Position
 
 fn is_valid_attack_target(
     target: &CommandAttackTargetQueryItem,
+    client_entity: &ClientEntity,
     position: &Position,
     team: &Team,
+    game_data: &GameData,
+    zone_list: &ZoneList,
 ) -> bool {
-    if target.team.id == team.id || target.team.id == Team::DEFAULT_NPC_TEAM_ID {
+    if target.client_entity.id == client_entity.id {
         return false;
     }
 
@@ -128,6 +133,28 @@ fn is_valid_attack_target(
     }
 
     if target.health_points.hp <= 0 {
+        return false;
+    }
+
+    if matches!(client_entity.entity_type, ClientEntityType::Character)
+        && matches!(
+            target.client_entity.entity_type,
+            ClientEntityType::Character
+        )
+    {
+        let Some(zone_data) = game_data.zones.get_zone(position.zone_id) else {
+            return false;
+        };
+
+        return can_character_attack_character(
+            zone_data,
+            zone_list.get_pvp_enabled(position.zone_id),
+            team.id,
+            target.team.id,
+        );
+    }
+
+    if target.team.id == team.id || target.team.id == Team::DEFAULT_NPC_TEAM_ID {
         return false;
     }
 
@@ -153,6 +180,7 @@ fn is_valid_pickup_target(target: &CommandPickupItemTargetQueryItem, position: &
 fn can_cast_skill(
     now: Instant,
     game_data: &GameData,
+    zone_list: &ZoneList,
     command_entity: Entity,
     target: &Option<CommandCastSkillTarget>,
     skill_id: SkillId,
@@ -177,7 +205,13 @@ fn can_cast_skill(
                 return false;
             };
 
-            if !skill_can_target_entity(&skill_caster, &skill_target, skill_data) {
+            if !skill_can_target_entity(
+                game_data,
+                zone_list,
+                &skill_caster,
+                &skill_target,
+                skill_data,
+            ) {
                 return false;
             }
         }
@@ -194,7 +228,7 @@ fn can_cast_skill(
                     | SkillType::SelfStateDuration
                     | SkillType::SummonPet
                     | SkillType::SelfDamage
-            ) && !skill_can_target_self(&skill_caster, skill_data)
+            ) && !skill_can_target_self(game_data, zone_list, &skill_caster, skill_data)
             {
                 return false;
             }
@@ -204,16 +238,43 @@ fn can_cast_skill(
     true
 }
 
+fn is_summon_points_limited(
+    game_data: &GameData,
+    skill_caster: &SkillCasterBundleItem,
+    skill_data: &SkillData,
+) -> bool {
+    if !matches!(skill_data.skill_type, SkillType::SummonPet) {
+        return false;
+    }
+
+    let Some(summon_npc_id) = skill_data.summon_npc_id else {
+        return false;
+    };
+    let Some(summon_npc_data) = game_data.npcs.get_npc(summon_npc_id) else {
+        return false;
+    };
+
+    if summon_npc_data.summon_point_requirement == 0 {
+        return false;
+    }
+
+    let used_points = skill_caster
+        .summon_usage
+        .map_or(0, |summon_usage| summon_usage.used_points);
+    used_points.saturating_add(summon_npc_data.summon_point_requirement)
+        > skill_caster.ability_values.get_max_summon_points()
+}
+
 pub fn command_system(
     mut commands: Commands,
     mut query_command_entity: Query<QueryCommandEntity>,
     query_move_target: Query<CommandMoveTargetQuery>,
     query_attack_target: Query<CommandAttackTargetQuery>,
     mut query_pickup_item: Query<CommandPickupItemTargetQuery>,
-    query_position: Query<(&ClientEntity, &Position)>,
     query_skill_target: Query<SkillTargetBundle>,
     query_skill_caster: Query<SkillCasterBundle>,
     game_data: Res<GameData>,
+    zone_list: Res<ZoneList>,
     time: Res<Time>,
     mut damage_events: EventWriter<DamageEvent>,
     mut skill_events: EventWriter<SkillEvent>,
@@ -292,8 +353,11 @@ pub fn command_system(
                             .filter(|target| {
                                 is_valid_attack_target(
                                     target,
+                                    command_entity.client_entity,
                                     command_entity.position,
                                     command_entity.team,
+                                    &game_data,
+                                    &zone_list,
                                 )
                             })
                     {
@@ -327,6 +391,7 @@ pub fn command_system(
                     if can_cast_skill(
                         now,
                         &game_data,
+                        &zone_list,
                         command_entity.entity,
                         skill_target,
                         skill_id,
@@ -335,22 +400,21 @@ pub fn command_system(
                     ) {
                         match skill_target {
                             Some(CommandCastSkillTarget::Entity(target_entity)) => {
-                                let (target_client_entity, target_position) =
-                                    query_position.get(*target_entity).unwrap();
+                                let skill_target = query_skill_target.get(*target_entity).unwrap();
                                 let distance = command_entity
                                     .position
                                     .position
                                     .xy()
-                                    .distance(target_position.position.xy());
+                                    .distance(skill_target.position.position.xy());
 
                                 server_messages.send_entity_message(
                                     command_entity.client_entity,
                                     ServerMessage::CastSkillTargetEntity {
                                         entity_id: command_entity.client_entity.id,
                                         skill_id,
-                                        target_entity_id: target_client_entity.id,
+                                        target_entity_id: skill_target.client_entity.id,
                                         target_distance: distance,
-                                        target_position: target_position.position.xy(),
+                                        target_position: skill_target.position.position.xy(),
                                         cast_motion_id,
                                     },
                                 );
@@ -601,7 +665,14 @@ pub fn command_system(
                     .get(target_entity)
                     .ok()
                     .filter(|target| {
-                        is_valid_attack_target(target, command_entity.position, command_entity.team)
+                        is_valid_attack_target(
+                            target,
+                            command_entity.client_entity,
+                            command_entity.position,
+                            command_entity.team,
+                            &game_data,
+                            &zone_list,
+                        )
                     })
                 else {
                     // Cannot attack target, cancel command.
@@ -755,12 +826,28 @@ pub fn command_system(
                 if !can_cast_skill(
                     now,
                     &game_data,
+                    &zone_list,
                     command_entity.entity,
                     &skill_target,
                     skill_id,
                     &query_skill_caster,
                     &query_skill_target,
                 ) {
+                    if let (Ok(skill_caster), Some(skill_data)) = (
+                        query_skill_caster.get(command_entity.entity),
+                        game_data.skills.get_skill(skill_id),
+                    ) {
+                        if is_summon_points_limited(&game_data, &skill_caster, skill_data) {
+                            server_messages.send_entity_message(
+                                command_entity.client_entity,
+                                ServerMessage::CancelCastingSkill {
+                                    entity_id: command_entity.client_entity.id,
+                                    reason: CancelCastingSkillReason::NeedSummonPoints,
+                                },
+                            );
+                        }
+                    }
+
                     // Cannot use skill (e.g. insufficient MP). Discard the cast request but
                     // preserve current combat intent to avoid breaking auto-attack state.
                     if let Some(target_entity) = command_entity.command.target_entity() {
@@ -778,8 +865,8 @@ pub fn command_system(
 
                 let (target_position, target_entity) = match skill_target {
                     Some(CommandCastSkillTarget::Entity(target_entity)) => {
-                        let (_, target_position) = query_position.get(target_entity).unwrap();
-                        (Some(target_position.position), Some(target_entity))
+                        let skill_target = query_skill_target.get(target_entity).unwrap();
+                        (Some(skill_target.position.position), Some(target_entity))
                     }
                     Some(CommandCastSkillTarget::Position(target_position)) => (
                         Some(Vec3::new(target_position.x, target_position.y, 0.0)),

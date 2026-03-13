@@ -16,6 +16,7 @@ members = [
     "rose-offline-server",
     "rose-offline-tools/rose-conv",
     "rose-offline-tools/rose-vfs-dump",
+    "rose-offline-tools/rose-dds-mipgen",
 ]
 
 [workspace.dependencies]

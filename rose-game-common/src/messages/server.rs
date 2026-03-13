@@ -19,7 +19,10 @@ use crate::{
         StatPoints, Team, UnionMembership,
     },
     data::Damage,
-    messages::{ClientEntityId, PartyItemSharing, PartyRejectInviteReason, PartyXpSharing},
+    messages::{
+        ClientEntityId, FriendInfo, FriendStatus, PartyItemSharing, PartyRejectInviteReason,
+        PartyXpSharing,
+    },
 };
 
 #[derive(Copy, Clone, Debug, Error, Serialize, Deserialize)]
@@ -205,6 +208,7 @@ pub enum PersonalStoreTransactionStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CancelCastingSkillReason {
     NeedAbility,
+    NeedSummonPoints,
     NeedTarget,
     InvalidTarget,
 }
@@ -284,6 +288,16 @@ pub enum CraftInsertGemError {
 }
 
 #[allow(dead_code)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub enum CraftCreateItemError {
+    Failed,
+    InvalidCondition,
+    NeedItem,
+    InvalidItem,
+    NeedSkillLevel,
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClanCreateError {
     Failed,
@@ -301,6 +315,18 @@ pub enum ClanInviteResponse {
     TargetNotFound,
     Rejected,
     Accepted,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClanUpgradeResult {
+    Success,
+    NoClan,
+    NoPermission,
+    InvalidNpc,
+    NpcTooFar,
+    MaxLevel,
+    InsufficientPoints,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -385,6 +411,7 @@ pub enum ServerMessage {
         entity_id: ClientEntityId,
         experience_points: ExperiencePoints,
         team: Team,
+        global_flags: u32,
         health_points: HealthPoints,
         mana_points: ManaPoints,
         world_ticks: WorldTicks,
@@ -545,6 +572,14 @@ pub enum ServerMessage {
         run_speed: i32,
         passive_attack_speed: i32,
     },
+    UpdateSummonPoints {
+        used_points: u16,
+        max_points: u16,
+    },
+    UpdateRecoveryRates {
+        hp_bonus: i32,
+        mp_bonus: i32,
+    },
     UpdateXpStamina {
         xp: u64,
         stamina: u32,
@@ -562,6 +597,34 @@ pub enum ServerMessage {
     },
     Whisper {
         from: String,
+        text: String,
+    },
+    FriendList {
+        friends: Vec<FriendInfo>,
+    },
+    FriendAddRequest {
+        requester_id: CharacterUniqueId,
+        name: String,
+    },
+    FriendAdded {
+        friend: FriendInfo,
+    },
+    FriendAddRejected {
+        name: String,
+    },
+    FriendAddTargetNotFound {
+        name: String,
+    },
+    FriendRemoved {
+        friend_id: CharacterUniqueId,
+    },
+    FriendStatusChanged {
+        friend_id: CharacterUniqueId,
+        status: FriendStatus,
+    },
+    FriendChat {
+        friend_id: CharacterUniqueId,
+        from_name: String,
         text: String,
     },
     LogoutSuccess,
@@ -728,6 +791,11 @@ pub enum ServerMessage {
         client_entity_id: ClientEntityId,
         item: Item,
     },
+    PartyLevelXp {
+        level: u8,
+        xp: u32,
+        is_level_up: bool,
+    },
     ChangeNpcId {
         entity_id: ClientEntityId,
         npc_id: NpcId,
@@ -748,6 +816,22 @@ pub enum ServerMessage {
     },
     CraftInsertGemError {
         error: CraftInsertGemError,
+    },
+    CraftCreateItemSuccess {
+        inventory_slot: ItemSlot,
+        item: Item,
+    },
+    CraftCreateItemError {
+        error: CraftCreateItemError,
+    },
+    CraftUpgradeSuccess {
+        update_items: Vec<(ItemSlot, Option<Item>)>,
+    },
+    CraftUpgradeFailed {
+        update_items: Vec<(ItemSlot, Option<Item>)>,
+    },
+    CraftDisassembleSuccess {
+        update_items: Vec<(ItemSlot, Option<Item>)>,
     },
     BankOpen,
     BankSetItems {
@@ -820,6 +904,9 @@ pub enum ServerMessage {
     },
     ClanInviteResult {
         response: ClanInviteResponse,
+    },
+    ClanUpgradeResult {
+        result: ClanUpgradeResult,
     },
     ClanMemberJoined {
         name: String,

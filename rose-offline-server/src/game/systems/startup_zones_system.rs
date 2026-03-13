@@ -11,6 +11,7 @@ use crate::game::{
         MoveMode, MoveSpeed, NextCommand, Npc, NpcAi, NpcStandingDirection, ObjectVariables,
         Position, StatusEffects, StatusEffectsRegen, Team,
     },
+    pvp::zone_is_initially_pvp_enabled,
     resources::{ClientEntityList, GameData, ZoneList},
     GameConfig,
 };
@@ -24,7 +25,7 @@ pub fn startup_zones_system(
 ) {
     for zone_data in game_data.zones.iter() {
         // Add to zone list
-        zone_list.add_zone(zone_data.id);
+        zone_list.add_zone(zone_data.id, zone_is_initially_pvp_enabled(zone_data));
 
         // Create the Event Object entities
         for event_object in zone_data.event_objects.iter() {

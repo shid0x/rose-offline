@@ -223,48 +223,65 @@ fn handle_party_accept_invite(
         .remove(invite_index);
 
     let is_create_party = owner.party_membership.party.is_none();
-    let (item_sharing, xp_sharing, party_members) = match owner.party_membership.party {
-        None => {
-            // Create a new party
-            let party = Party::new(
-                owner_entity,
-                &[
-                    PartyMember::Online(owner_entity),
-                    PartyMember::Online(invited_entity),
-                ],
-            );
-            let item_sharing = party.item_sharing;
-            let xp_sharing = party.xp_sharing;
-            let party_members = party.members.clone();
-            let party_entity = commands.spawn(party).id();
+    let (item_sharing, xp_sharing, party_members, party_level, party_experience) =
+        match owner.party_membership.party {
+            None => {
+                // Create a new party
+                let party = Party::new(
+                    owner_entity,
+                    &[
+                        PartyMember::Online(owner_entity),
+                        PartyMember::Online(invited_entity),
+                    ],
+                );
+                let item_sharing = party.item_sharing;
+                let xp_sharing = party.xp_sharing;
+                let party_members = party.members.clone();
+                let party_level = party.level;
+                let party_experience = party.experience;
+                let party_entity = commands.spawn(party).id();
 
-            *owner.party_membership = PartyMembership::new(party_entity);
-            *invited.party_membership = PartyMembership::new(party_entity);
+                *owner.party_membership = PartyMembership::new(party_entity);
+                *invited.party_membership = PartyMembership::new(party_entity);
 
-            (item_sharing, xp_sharing, party_members)
-        }
-        Some(party_entity) => {
-            // Add to current party
-            let Ok(mut party) = party_query.get_mut(party_entity) else {
-                // This must mean two party creation invites were accepted the same frame,
-                // we are just gonna have to drop this invite and let the players sort it out
-                return Err(PartyInviteError::InvalidEntity);
-            };
-
-            if owner_entity != party.owner {
-                return Err(PartyInviteError::NoPermission);
+                (
+                    item_sharing,
+                    xp_sharing,
+                    party_members,
+                    party_level,
+                    party_experience,
+                )
             }
+            Some(party_entity) => {
+                // Add to current party
+                let Ok(mut party) = party_query.get_mut(party_entity) else {
+                    // This must mean two party creation invites were accepted the same frame,
+                    // we are just gonna have to drop this invite and let the players sort it out
+                    return Err(PartyInviteError::InvalidEntity);
+                };
 
-            if party.members.len() >= party.members.capacity() {
-                return Err(PartyInviteError::PartyFull);
+                if owner_entity != party.owner {
+                    return Err(PartyInviteError::NoPermission);
+                }
+
+                if party.members.len() >= party.members.capacity() {
+                    return Err(PartyInviteError::PartyFull);
+                }
+
+                party.members.push(PartyMember::Online(invited_entity));
+                *invited.party_membership = PartyMembership::new(party_entity);
+
+                let party_level = party.level;
+                let party_experience = party.experience;
+                (
+                    party.item_sharing,
+                    party.xp_sharing,
+                    party.members.clone(),
+                    party_level,
+                    party_experience,
+                )
             }
-
-            party.members.push(PartyMember::Online(invited_entity));
-            *invited.party_membership = PartyMembership::new(party_entity);
-
-            (party.item_sharing, party.xp_sharing, party.members.clone())
-        }
-    };
+        };
 
     // Send accept create to owner
     if is_create_party {
@@ -273,6 +290,16 @@ fn handle_party_accept_invite(
                 .server_message_tx
                 .send(ServerMessage::PartyAcceptCreate {
                     entity_id: invited.client_entity.id,
+                })
+                .ok();
+
+            // Send initial party level and XP to owner
+            owner_game_client
+                .server_message_tx
+                .send(ServerMessage::PartyLevelXp {
+                    level: party_level as u8,
+                    xp: party_experience as u32,
+                    is_level_up: false,
                 })
                 .ok();
         }
@@ -297,6 +324,16 @@ fn handle_party_accept_invite(
                 xp_sharing,
                 owner_character_id: owner.character_info.unique_id,
                 members: other_members_info,
+            })
+            .ok();
+
+        // Send current party level and XP to the newly joined member
+        invited_game_client
+            .server_message_tx
+            .send(ServerMessage::PartyLevelXp {
+                level: party_level as u8,
+                xp: party_experience as u32,
+                is_level_up: false,
             })
             .ok();
     }
@@ -937,6 +974,7 @@ pub fn party_member_update_info_system(
         Or<(
             Changed<AbilityValues>,
             Changed<ClientEntity>,
+            Changed<HealthPoints>,
             Changed<StatusEffects>,
         )>,
     >,

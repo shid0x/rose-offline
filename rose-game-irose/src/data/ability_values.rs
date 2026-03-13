@@ -114,6 +114,7 @@ impl AbilityValueCalculator for AbilityValuesData {
             npc_store_buy_rate: 0,
             npc_store_sell_rate: 0,
             save_mana: 0,
+            passive_max_summons: 0,
         })
     }
 
@@ -342,6 +343,7 @@ impl AbilityValueCalculator for AbilityValuesData {
             adjust: status_effects.into(),
             npc_store_buy_rate: passive_ability_values.value.buy_skill,
             npc_store_sell_rate: passive_ability_values.value.sell_skill,
+            passive_max_summons: passive_ability_values.value.max_summons,
         }
     }
 

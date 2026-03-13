@@ -53,6 +53,7 @@ pub enum ClientPackets {
     ChangeAmmo = 0x7ab,
     BankOpen = 0x7ad,
     BankMoveItem = 0x7ae,
+    CreateItem = 0x7af,
     LevelUpSkill = 0x7b1,
     CastSkillSelf = 0x7b2,
     CastSkillTargetEntity = 0x7b3,
@@ -67,6 +68,8 @@ pub enum ClientPackets {
     PartyReply = 0x7d1,
     PartyUpdateRules = 0x7d7,
     ClanCommand = 0x7e0,
+    Messenger = 0x7e1,
+    MessengerChat = 0x7e2,
 }
 
 #[derive(Debug)]
@@ -228,6 +231,105 @@ impl<'a> TryFrom<&'a Packet> for PacketClientChat<'a> {
         let mut reader = PacketReader::from(packet);
         let text = reader.read_null_terminated_utf8()?;
         Ok(PacketClientChat { text })
+    }
+}
+
+#[derive(Debug)]
+pub enum PacketClientMessenger<'a> {
+    FriendAdd {
+        name: &'a str,
+    },
+    FriendAddResponse {
+        requester_id: CharacterUniqueId,
+        accept: bool,
+    },
+    FriendRemove {
+        friend_id: CharacterUniqueId,
+    },
+    FriendList,
+}
+
+impl<'a> TryFrom<&'a Packet> for PacketClientMessenger<'a> {
+    type Error = PacketError;
+
+    fn try_from(packet: &'a Packet) -> Result<Self, Self::Error> {
+        if packet.command != ClientPackets::Messenger as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let command = reader.read_u8()?;
+        match command {
+            0x01 => Ok(PacketClientMessenger::FriendAdd {
+                name: reader.read_null_terminated_utf8()?,
+            }),
+            0x02 | 0x03 => Ok(PacketClientMessenger::FriendAddResponse {
+                requester_id: reader.read_u32()?,
+                accept: command == 0x02,
+            }),
+            0x05 => Ok(PacketClientMessenger::FriendRemove {
+                friend_id: reader.read_u32()?,
+            }),
+            0x06 => Ok(PacketClientMessenger::FriendList),
+            _ => Err(PacketError::InvalidPacket),
+        }
+    }
+}
+
+impl<'a> From<&'a PacketClientMessenger<'a>> for Packet {
+    fn from(packet: &'a PacketClientMessenger<'a>) -> Self {
+        let mut writer = PacketWriter::new(ClientPackets::Messenger as u16);
+        match packet {
+            PacketClientMessenger::FriendAdd { name } => {
+                writer.write_u8(0x01);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketClientMessenger::FriendAddResponse {
+                requester_id,
+                accept,
+            } => {
+                writer.write_u8(if *accept { 0x02 } else { 0x03 });
+                writer.write_u32(*requester_id);
+            }
+            PacketClientMessenger::FriendRemove { friend_id } => {
+                writer.write_u8(0x05);
+                writer.write_u32(*friend_id);
+            }
+            PacketClientMessenger::FriendList => {
+                writer.write_u8(0x06);
+            }
+        }
+        writer.into()
+    }
+}
+
+#[derive(Debug)]
+pub struct PacketClientMessengerChat<'a> {
+    pub friend_id: CharacterUniqueId,
+    pub text: &'a str,
+}
+
+impl<'a> TryFrom<&'a Packet> for PacketClientMessengerChat<'a> {
+    type Error = PacketError;
+
+    fn try_from(packet: &'a Packet) -> Result<Self, Self::Error> {
+        if packet.command != ClientPackets::MessengerChat as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let friend_id = reader.read_u32()?;
+        let text = reader.read_null_terminated_utf8()?;
+        Ok(PacketClientMessengerChat { friend_id, text })
+    }
+}
+
+impl<'a> From<&'a PacketClientMessengerChat<'a>> for Packet {
+    fn from(packet: &'a PacketClientMessengerChat<'a>) -> Self {
+        let mut writer = PacketWriter::new(ClientPackets::MessengerChat as u16);
+        writer.write_u32(packet.friend_id);
+        writer.write_null_terminated_utf8(packet.text);
+        writer.into()
     }
 }
 
@@ -1419,6 +1521,53 @@ impl From<&PacketClientCraftItem> for Packet {
     }
 }
 
+pub struct PacketClientCreateItem {
+    pub skill_slot: SkillSlot,
+    pub target_item_type: u8,
+    pub target_item_number: u16,
+    pub material_inventory_slots: [ItemSlot; 4],
+}
+
+impl TryFrom<&Packet> for PacketClientCreateItem {
+    type Error = PacketError;
+
+    fn try_from(packet: &Packet) -> Result<Self, Self::Error> {
+        if packet.command != ClientPackets::CreateItem as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let skill_slot = reader.read_skill_slot_u8()?;
+        let target_item_type = reader.read_u8()?;
+        let target_item_number = reader.read_u16()?;
+        let mat0 = reader.read_item_slot_u16()?;
+        let mat1 = reader.read_item_slot_u16()?;
+        let mat2 = reader.read_item_slot_u16()?;
+        let mat3 = reader.read_item_slot_u16()?;
+
+        Ok(PacketClientCreateItem {
+            skill_slot,
+            target_item_type,
+            target_item_number,
+            material_inventory_slots: [mat0, mat1, mat2, mat3],
+        })
+    }
+}
+
+impl From<&PacketClientCreateItem> for Packet {
+    fn from(packet: &PacketClientCreateItem) -> Self {
+        let mut writer = PacketWriter::new(ClientPackets::CreateItem as u16);
+        writer.write_skill_slot_u8(packet.skill_slot);
+        writer.write_u8(packet.target_item_type);
+        writer.write_u16(packet.target_item_number);
+        writer.write_item_slot_u16(packet.material_inventory_slots[0]);
+        writer.write_item_slot_u16(packet.material_inventory_slots[1]);
+        writer.write_item_slot_u16(packet.material_inventory_slots[2]);
+        writer.write_item_slot_u16(packet.material_inventory_slots[3]);
+        writer.into()
+    }
+}
+
 pub struct PacketClientBankOpen {}
 
 impl TryFrom<&Packet> for PacketClientBankOpen {
@@ -1547,6 +1696,9 @@ pub enum PacketClientClanCommand {
     Demote {
         name: String,
     },
+    Upgrade {
+        npc_entity_id: ClientEntityId,
+    },
     Leave,
     Disband,
     AcceptInvite {
@@ -1586,6 +1738,9 @@ impl TryFrom<&Packet> for PacketClientClanCommand {
             }),
             12 => Ok(PacketClientClanCommand::Demote {
                 name: reader.read_null_terminated_utf8()?.to_string(),
+            }),
+            16 => Ok(PacketClientClanCommand::Upgrade {
+                npc_entity_id: reader.read_entity_id()?,
             }),
             7 => Ok(PacketClientClanCommand::Leave),
             10 => Ok(PacketClientClanCommand::Disband),
@@ -1633,6 +1788,10 @@ impl From<&PacketClientClanCommand> for Packet {
             PacketClientClanCommand::Demote { name } => {
                 writer.write_u8(12);
                 writer.write_null_terminated_utf8(name);
+            }
+            PacketClientClanCommand::Upgrade { npc_entity_id } => {
+                writer.write_u8(16);
+                writer.write_entity_id(*npc_entity_id);
             }
             PacketClientClanCommand::Leave => {
                 writer.write_u8(7);

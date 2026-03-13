@@ -5,6 +5,7 @@ use bevy::{
         prelude::{Commands, Entity, EventWriter, Query, Res, ResMut},
         query::WorldQuery,
         system::SystemParam,
+        world::World,
     },
     time::Time,
 };
@@ -31,10 +32,11 @@ use rose_game_common::{data::Damage, messages::PartyXpSharing};
 use crate::game::{
     bundles::{client_entity_leave_zone, ItemDropBundle, MonsterBundle},
     components::{
-        AbilityValues, Clan, ClanMembership, ClientEntity, ClientEntitySector, ClientEntityType,
-        Command, CommandData, DamageSources, DroppedItem, GameClient, HealthPoints, Level,
-        MonsterSpawnPoint, MoveMode, NextCommand, Npc, NpcAi, ObjectVariables, Owner, Party,
-        PartyMember, PartyMembership, Position, SpawnOrigin, StatusEffects, Team,
+        apply_party_xp_gain, party_xp_gain, AbilityValues, Clan, ClanMembership, ClientEntity,
+        ClientEntitySector, ClientEntityType, Command, CommandData, DamageSources, DroppedItem,
+        GameClient, HealthPoints, Level, ManaPoints, MonsterSpawnPoint, MoveMode, NextCommand, Npc,
+        NpcAi, ObjectVariables, Owner, Party, PartyMember, PartyMembership, Position, SpawnOrigin,
+        StatusEffects, Team, MAX_PARTY_LEVEL,
     },
     events::{DamageEvent, QuestTriggerEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
@@ -816,11 +818,20 @@ fn npc_ai_check_conditions(
     true
 }
 
+fn queue_next_command(commands: &mut Commands, entity: Entity, next_command: NextCommand) {
+    commands.add(move |world: &mut World| {
+        if let Some(mut entity_mut) = world.get_entity_mut(entity) {
+            entity_mut.insert(next_command);
+        }
+    });
+}
+
 fn ai_action_stop(ai_system_parameters: &mut AiSystemParameters, ai_parameters: &mut AiParameters) {
-    ai_system_parameters
-        .commands
-        .entity(ai_parameters.source.entity)
-        .insert(NextCommand::with_stop(true));
+    queue_next_command(
+        &mut ai_system_parameters.commands,
+        ai_parameters.source.entity,
+        NextCommand::with_stop(true),
+    );
 }
 
 fn ai_action_attack_attacker(
@@ -828,10 +839,11 @@ fn ai_action_attack_attacker(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some(attacker) = ai_parameters.attacker {
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_attack(attacker.entity));
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_attack(attacker.entity),
+        );
     }
 }
 
@@ -840,10 +852,11 @@ fn ai_action_attack_find_char(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some((find_char, _)) = ai_parameters.find_char {
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_attack(find_char));
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_attack(find_char),
+        );
     }
 }
 
@@ -852,10 +865,11 @@ fn ai_action_attack_near_char(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some((near_char, _)) = ai_parameters.near_char {
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_attack(near_char));
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_attack(near_char),
+        );
     }
 }
 
@@ -878,10 +892,11 @@ fn ai_action_move_away_from_target(
             let move_vector = distance as f32 * direction_away_from_target;
             let destination = source_position + Vec3::new(move_vector.x, move_vector.y, 0.0);
 
-            ai_system_parameters
-                .commands
-                .entity(ai_parameters.source.entity)
-                .insert(NextCommand::with_move(destination, None, Some(move_mode)));
+            queue_next_command(
+                &mut ai_system_parameters.commands,
+                ai_parameters.source.entity,
+                NextCommand::with_move(destination, None, Some(move_mode)),
+            );
         }
     }
 }
@@ -916,10 +931,11 @@ fn ai_action_move_random_distance(
             AipMoveMode::Walk => MoveMode::Walk,
         };
         let destination = move_origin + Vec3::new(dx as f32, dy as f32, 0.0);
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_move(destination, None, Some(move_mode)));
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_move(destination, None, Some(move_mode)),
+        );
     }
 }
 
@@ -939,14 +955,15 @@ fn ai_action_move_near_owner(
         let direction = delta.normalize();
         let destination = ai_parameters.source.position.position.xy() + direction * distance;
 
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_move(
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_move(
                 Vec3::new(destination.x, destination.y, 0.0),
                 None,
                 Some(MoveMode::Run),
-            ));
+            ),
+        );
     }
 }
 
@@ -965,10 +982,11 @@ fn ai_action_attack_owner_target(
                 && target.team.id != ai_parameters.source.team.id
                 && target.health_points.hp > 0
             {
-                ai_system_parameters
-                    .commands
-                    .entity(ai_parameters.source.entity)
-                    .insert(NextCommand::with_attack(owner_target_entity));
+                queue_next_command(
+                    &mut ai_system_parameters.commands,
+                    ai_parameters.source.entity,
+                    NextCommand::with_attack(owner_target_entity),
+                );
             }
         }
     }
@@ -1031,10 +1049,11 @@ fn ai_action_attack_nearby_entity_by_stat(
     };
 
     if let Some(target_entity) = target_entity {
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(NextCommand::with_attack(target_entity));
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            NextCommand::with_attack(target_entity),
+        );
     }
 }
 
@@ -1132,10 +1151,11 @@ fn ai_action_nearby_allies_attack_target(
                 continue;
             }
 
-            ai_system_parameters
-                .commands
-                .entity(nearby_entity)
-                .insert(NextCommand::with_attack(target_entity));
+            queue_next_command(
+                &mut ai_system_parameters.commands,
+                nearby_entity,
+                NextCommand::with_attack(target_entity),
+            );
 
             num_attackers += 1;
         }
@@ -1233,10 +1253,11 @@ fn ai_action_use_emote(
 ) {
     let motion_id = MotionId::new(motion_id as u16);
 
-    ai_system_parameters
-        .commands
-        .entity(ai_parameters.source.entity)
-        .insert(NextCommand::with_emote(motion_id, true));
+    queue_next_command(
+        &mut ai_system_parameters.commands,
+        ai_parameters.source.entity,
+        NextCommand::with_emote(motion_id, true),
+    );
 }
 
 fn ai_action_use_skill(
@@ -1268,10 +1289,11 @@ fn ai_action_use_skill(
             NextCommand::with_npc_cast_skill_self(skill_id, cast_motion_id, action_motion_id)
         };
 
-        ai_system_parameters
-            .commands
-            .entity(ai_parameters.source.entity)
-            .insert(next_command);
+        queue_next_command(
+            &mut ai_system_parameters.commands,
+            ai_parameters.source.entity,
+            next_command,
+        );
     }
 }
 
@@ -1296,6 +1318,21 @@ fn ai_action_set_monster_spawn_state(
     ai_system_parameters
         .zone_list
         .set_monster_spawns_enabled(zone_id, enabled);
+}
+
+fn ai_action_set_pvp_flag(
+    ai_system_parameters: &mut AiSystemParameters,
+    ai_parameters: &mut AiParameters,
+    zone_id: Option<AipZoneId>,
+    enabled: bool,
+) {
+    let zone_id = zone_id
+        .and_then(|zone_id| ZoneId::new(zone_id as u16))
+        .unwrap_or(ai_parameters.source.position.zone_id);
+
+    ai_system_parameters
+        .zone_list
+        .set_pvp_enabled(zone_id, enabled);
 }
 
 fn ai_action_set_variable(
@@ -1553,6 +1590,9 @@ fn npc_ai_do_actions(
             AipAction::SetMonsterSpawnState(zone, state) => {
                 ai_action_set_monster_spawn_state(ai_system_parameters, ai_parameters, zone, state)
             }
+            AipAction::SetPvpFlag(zone, enabled) => {
+                ai_action_set_pvp_flag(ai_system_parameters, ai_parameters, zone, enabled)
+            }
             AipAction::SetVariable(variable_type, variable_id, operator, value) => {
                 ai_action_set_variable(
                     ai_system_parameters,
@@ -1587,7 +1627,6 @@ fn npc_ai_do_actions(
             ),
             /*
             AipAction::RunAway(_) => {},
-            AipAction::SetPvpFlag(_, _) => {}
             */
             _ => {
                 log::warn!(target: "npc_ai_unimplemented", "Unimplemented AI action: {:?}", action);
@@ -1643,7 +1682,7 @@ pub fn npc_ai_system(
     mut spawn_point_query: Query<&mut MonsterSpawnPoint>,
     attacker_query: Query<AttackerQuery>,
     killer_query: Query<KillerQuery>,
-    query_party: Query<&Party>,
+    mut query_party: Query<&mut Party>,
     world_rates: Res<WorldRates>,
     mut reward_xp_events: EventWriter<RewardXpEvent>,
 ) {
@@ -1837,12 +1876,11 @@ pub fn npc_ai_system(
                             for (party_entity, total_xp, first_party_member) in
                                 pending_party_xp.drain(..)
                             {
-                                let mut party_members_in_range: ArrayVec<(Entity, Level), 5> =
+                                let mut party_members_in_range: ArrayVec<(Entity, Level), 7> =
                                     ArrayVec::new();
                                 let mut party_share_xp_evenly = true;
                                 let mut party_level = 1;
                                 let mut party_average_member_level = 1;
-
                                 if let Ok(party) = query_party.get(party_entity) {
                                     for party_member in party
                                         .members
@@ -1914,6 +1952,90 @@ pub fn npc_ai_system(
                                             true,
                                             Some(source.entity),
                                         ));
+                                    }
+                                }
+
+                                // Party XP accumulation and leveling
+                                if party_members_in_range.len() > 1 && party_level < MAX_PARTY_LEVEL
+                                {
+                                    // Get zone party XP parameters
+                                    let (zone_party_xp_a, zone_party_xp_b) = ai_system_resources
+                                        .game_data
+                                        .zones
+                                        .get_zone(source.position.zone_id)
+                                        .map(|zone_data| {
+                                            (
+                                                zone_data.party_xp_a as i64,
+                                                zone_data.party_xp_b as i64,
+                                            )
+                                        })
+                                        .unwrap_or((2, 2));
+
+                                    if let Ok(mut party) = query_party.get_mut(party_entity) {
+                                        let previous_xp = party.experience;
+                                        let diff_level =
+                                            source.level.level as i32 - party_average_member_level;
+                                        let gain = party_xp_gain(
+                                            diff_level,
+                                            zone_party_xp_a,
+                                            zone_party_xp_b,
+                                        );
+                                        let (new_level, new_xp, is_level_up) = apply_party_xp_gain(
+                                            party.level,
+                                            party.experience,
+                                            gain,
+                                        );
+
+                                        party.level = new_level;
+                                        party.experience = new_xp;
+
+                                        if party.experience != previous_xp || is_level_up {
+                                            // Broadcast party level/XP to all members
+                                            let msg = ServerMessage::PartyLevelXp {
+                                                level: party.level as u8,
+                                                xp: party.experience as u32,
+                                                is_level_up,
+                                            };
+                                            for party_member in party.members.iter() {
+                                                if let Some(entity) = party_member.get_entity() {
+                                                    if let Ok(member) = killer_query.get(entity) {
+                                                        if let Some(game_client) =
+                                                            member.game_client
+                                                        {
+                                                            game_client
+                                                                .server_message_tx
+                                                                .send(msg.clone())
+                                                                .ok();
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // On party level-up, restore all online members to full HP/MP
+                                            if is_level_up {
+                                                for party_member in party.members.iter() {
+                                                    if let Some(entity) = party_member.get_entity()
+                                                    {
+                                                        if let Ok(member) = killer_query.get(entity)
+                                                        {
+                                                            let max_hp = member
+                                                                .ability_values
+                                                                .get_max_health();
+                                                            let max_mp = member
+                                                                .ability_values
+                                                                .get_max_mana();
+                                                            ai_system_parameters
+                                                                .commands
+                                                                .entity(entity)
+                                                                .insert((
+                                                                    HealthPoints::new(max_hp),
+                                                                    ManaPoints::new(max_mp),
+                                                                ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2004,5 +2126,33 @@ pub fn npc_ai_system(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::{
+        prelude::World,
+        system::{CommandQueue, Commands},
+    };
+
+    use super::queue_next_command;
+    use crate::game::components::NextCommand;
+
+    #[test]
+    fn queued_next_command_skips_entities_despawned_earlier_in_the_same_flush() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let mut queue = CommandQueue::default();
+
+        {
+            let mut commands = Commands::new(&mut queue, &world);
+            commands.entity(entity).despawn();
+            queue_next_command(&mut commands, entity, NextCommand::with_stop(true));
+        }
+
+        queue.apply(&mut world);
+
+        assert!(world.get_entity(entity).is_none());
     }
 }

@@ -282,6 +282,22 @@ fn load_zone(
         id: ZoneId::new(id as u16).unwrap(),
         name,
         description,
+        pvp_state: data.get_zone_pvp_state(id).unwrap_or(0),
+        join_trigger: data
+            .get_zone_join_trigger(id)
+            .map(str::trim)
+            .filter(|trigger| !trigger.is_empty())
+            .map(ToOwned::to_owned),
+        kill_trigger: data
+            .get_zone_kill_trigger(id)
+            .map(str::trim)
+            .filter(|trigger| !trigger.is_empty())
+            .map(ToOwned::to_owned),
+        dead_trigger: data
+            .get_zone_dead_trigger(id)
+            .map(str::trim)
+            .filter(|trigger| !trigger.is_empty())
+            .map(ToOwned::to_owned),
         sector_size,
         grid_per_patch: zon_file.grid_per_patch,
         grid_size: zon_file.grid_size,
@@ -319,6 +335,14 @@ fn load_zone(
             .get_zone_night_time(id)
             .unwrap_or((5 * WORLD_TICKS_PER_DAY / 6) as u32),
         skybox_id: data.get_zone_skybox_id(id),
+        party_xp_a: data
+            .get_zone_party_xp_a(id)
+            .filter(|&v| v != 0)
+            .unwrap_or(2),
+        party_xp_b: data
+            .get_zone_party_xp_b(id)
+            .filter(|&v| v != 0)
+            .unwrap_or(2),
     })
 }
 
@@ -393,4 +417,54 @@ pub fn get_zone_list(
     }
 
     Ok(ZoneList::new(string_database, zones))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use rose_data::ZoneId;
+    use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
+
+    use crate::get_string_database;
+
+    use super::get_zone_database;
+
+    fn create_test_vfs() -> VirtualFilesystem {
+        let root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(root_path))])
+    }
+
+    #[test]
+    fn clan_field_zones_load_monster_spawns_from_assets() {
+        let vfs = create_test_vfs();
+        let string_database =
+            get_string_database(&vfs, 1).expect("failed to load string database for test");
+        let zone_database =
+            get_zone_database(&vfs, string_database).expect("failed to load zone database");
+
+        let junon_clan_field = zone_database
+            .get_zone(ZoneId::new(11).unwrap())
+            .expect("missing Junon clan field");
+        let luna_clan_field = zone_database
+            .get_zone(ZoneId::new(59).unwrap())
+            .expect("missing Luna clan field");
+
+        assert_eq!(junon_clan_field.monster_spawns.len(), 13);
+        assert_eq!(luna_clan_field.monster_spawns.len(), 8);
+        assert!(
+            junon_clan_field
+                .monster_spawns
+                .iter()
+                .all(|spawn| !spawn.basic_spawns.is_empty()),
+            "expected all Junon clan field spawn points to contain at least one basic spawn"
+        );
+        assert!(
+            luna_clan_field
+                .monster_spawns
+                .iter()
+                .all(|spawn| !spawn.basic_spawns.is_empty()),
+            "expected all Luna clan field spawn points to contain at least one basic spawn"
+        );
+    }
 }

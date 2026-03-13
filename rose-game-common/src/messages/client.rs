@@ -10,7 +10,8 @@ use crate::{
     messages::{ClientEntityId, PartyItemSharing, PartyRejectInviteReason, PartyXpSharing},
 };
 use rose_data::{
-    AmmoIndex, EquipmentIndex, Item, MotionId, QuestTriggerHash, VehiclePartIndex, WarpGateId,
+    AmmoIndex, EquipmentIndex, Item, ItemType, MotionId, QuestTriggerHash, VehiclePartIndex,
+    WarpGateId,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +68,21 @@ pub enum ClientMessage {
     },
     JoinZoneRequest,
     Chat {
+        text: String,
+    },
+    FriendListRequest,
+    FriendAdd {
+        name: String,
+    },
+    FriendAddResponse {
+        requester_id: CharacterUniqueId,
+        accept: bool,
+    },
+    FriendRemove {
+        friend_id: CharacterUniqueId,
+    },
+    FriendChat {
+        friend_id: CharacterUniqueId,
         text: String,
     },
     Move {
@@ -194,6 +210,12 @@ pub enum ClientMessage {
         equipment_index: EquipmentIndex,
         item_slot: ItemSlot,
     },
+    CraftCreateItem {
+        skill_slot: SkillSlot,
+        target_item_type: ItemType,
+        target_item_number: usize,
+        material_inventory_slots: [ItemSlot; 4],
+    },
     CraftSkillDisassemble {
         skill_slot: SkillSlot,
         item_slot: ItemSlot,
@@ -261,6 +283,9 @@ pub enum ClientMessage {
     },
     ClanDemote {
         name: String,
+    },
+    ClanUpgrade {
+        npc_entity_id: ClientEntityId,
     },
     ClanLeave,
     ClanDisband,

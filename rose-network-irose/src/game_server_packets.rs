@@ -1,4 +1,7 @@
-use std::{num::{NonZeroU16, NonZeroUsize}, time::Duration};
+use std::{
+    num::{NonZeroU16, NonZeroUsize},
+    time::Duration,
+};
 
 use bevy::math::{Vec2, Vec3};
 use bitvec::array::BitArray;
@@ -27,12 +30,13 @@ use rose_game_common::{
     messages::{
         server::{
             ActiveStatusEffects, CancelCastingSkillReason, CharacterClanMembership,
-            ClanCreateError, ClanInviteResponse, ClanMemberInfo, CraftInsertGemError,
-            LearnSkillError, LevelUpSkillError, NpcStoreTransactionError, PartyMemberInfo,
-            PartyMemberInfoOnline, PersonalStoreTransactionStatus, PickupItemDropError,
-            SpawnCommandState,
+            ClanCreateError, ClanInviteResponse, ClanMemberInfo, ClanUpgradeResult,
+            CraftInsertGemError, LearnSkillError, LevelUpSkillError, NpcStoreTransactionError,
+            PartyMemberInfo, PartyMemberInfoOnline, PersonalStoreTransactionStatus,
+            PickupItemDropError, SpawnCommandState,
         },
-        ClientEntityId, PartyItemSharing, PartyRejectInviteReason, PartyXpSharing,
+        ClientEntityId, FriendInfo, FriendStatus, PartyItemSharing, PartyRejectInviteReason,
+        PartyXpSharing,
     },
 };
 use rose_network_common::{Packet, PacketError, PacketReader, PacketWriter};
@@ -97,6 +101,7 @@ pub enum ServerPackets {
     UpdateAmmo = 0x7ab,
     BankOpen = 0x7ad,
     BankTransaction = 0x7ae,
+    CreateItemResult = 0x7af,
     LearnSkillResult = 0x7b0,
     LevelUpSkillResult = 0x7b1,
     CastSkillSelf = 0x7b2,
@@ -123,9 +128,14 @@ pub enum ServerPackets {
     PartyReply = 0x7d1,
     PartyMembers = 0x7d2,
     PartyMemberRewardItem = 0x7d3,
+    PartyLevelXp = 0x7d4,
     PartyMemberUpdateInfo = 0x7d5,
     PartyUpdateRules = 0x7d7,
     ClanCommand = 0x7e0,
+    Messenger = 0x7e1,
+    MessengerChat = 0x7e2,
+    UpdateSummonPoints = 0x7f1,
+    UpdateRecoveryRates = 0x7f2,
 }
 
 #[allow(dead_code)]
@@ -961,6 +971,7 @@ pub struct PacketServerJoinZone {
     pub entity_id: ClientEntityId,
     pub experience_points: ExperiencePoints,
     pub team: Team,
+    pub global_flags: u32,
     pub health_points: HealthPoints,
     pub mana_points: ManaPoints,
     pub world_ticks: WorldTicks,
@@ -995,7 +1006,7 @@ impl TryFrom<&Packet> for PacketServerJoinZone {
         for _ in 1..11 {
             let _item_price_rate_n = reader.read_u8()?;
         }
-        let _global_flags = reader.read_u32()?;
+        let global_flags = reader.read_u32()?;
 
         let world_ticks = WorldTicks(reader.read_u32()? as u64);
         let team = Team::new(reader.read_u32()?);
@@ -1004,6 +1015,7 @@ impl TryFrom<&Packet> for PacketServerJoinZone {
             entity_id,
             experience_points,
             team,
+            global_flags,
             health_points,
             mana_points,
             world_ticks,
@@ -1033,7 +1045,7 @@ impl From<&PacketServerJoinZone> for Packet {
         for _ in 0..11 {
             writer.write_u8(packet.item_price_rate as u8);
         }
-        writer.write_u32(0); // global flags (0x1 = pvp allowed)
+        writer.write_u32(packet.global_flags);
 
         writer.write_u32(packet.world_ticks.0 as u32);
         writer.write_u32(packet.team.id);
@@ -1154,6 +1166,175 @@ impl<'a> From<&'a PacketServerWhisper<'a>> for Packet {
     fn from(packet: &'a PacketServerWhisper<'a>) -> Self {
         let mut writer = PacketWriter::new(ServerPackets::Whisper as u16);
         writer.write_null_terminated_utf8(packet.from);
+        writer.write_null_terminated_utf8(packet.text);
+        writer.into()
+    }
+}
+
+fn decode_friend_status(status: u8) -> Result<FriendStatus, PacketError> {
+    match status {
+        0x07 | 0x00 => Ok(FriendStatus::Online),
+        0x08 => Ok(FriendStatus::Offline),
+        0x80 => Ok(FriendStatus::Refused),
+        0x81 => Ok(FriendStatus::Deleted),
+        _ => Err(PacketError::InvalidPacket),
+    }
+}
+
+fn encode_friend_status(status: FriendStatus) -> u8 {
+    match status {
+        FriendStatus::Online => 0x07,
+        FriendStatus::Offline => 0x08,
+        FriendStatus::Refused => 0x80,
+        FriendStatus::Deleted => 0x81,
+    }
+}
+
+pub enum PacketServerMessenger<'a> {
+    FriendAddRequest {
+        requester_id: CharacterUniqueId,
+        name: &'a str,
+    },
+    FriendAdded {
+        friend: FriendInfo,
+    },
+    FriendAddRejected {
+        name: &'a str,
+    },
+    FriendAddTargetNotFound {
+        name: &'a str,
+    },
+    FriendStatusChanged {
+        friend_id: CharacterUniqueId,
+        status: FriendStatus,
+    },
+    FriendList {
+        friends: Vec<FriendInfo>,
+    },
+}
+
+impl<'a> TryFrom<&'a Packet> for PacketServerMessenger<'a> {
+    type Error = PacketError;
+
+    fn try_from(packet: &'a Packet) -> Result<Self, Self::Error> {
+        if packet.command != ServerPackets::Messenger as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        match reader.read_u8()? {
+            0x01 => Ok(PacketServerMessenger::FriendAddRequest {
+                requester_id: reader.read_u32()?,
+                name: reader.read_null_terminated_utf8()?,
+            }),
+            0x02 => {
+                let friend_id = reader.read_u32()?;
+                let status = decode_friend_status(reader.read_u8()?)?;
+                let name = reader.read_null_terminated_utf8()?.to_string();
+                Ok(PacketServerMessenger::FriendAdded {
+                    friend: FriendInfo {
+                        character_id: friend_id,
+                        name,
+                        status,
+                    },
+                })
+            }
+            0x03 => Ok(PacketServerMessenger::FriendAddRejected {
+                name: reader.read_null_terminated_utf8()?,
+            }),
+            0x04 => Ok(PacketServerMessenger::FriendAddTargetNotFound {
+                name: reader.read_null_terminated_utf8()?,
+            }),
+            0x06 => {
+                let friend_count = reader.read_u8()? as usize;
+                let mut friends = Vec::with_capacity(friend_count);
+                for _ in 0..friend_count {
+                    let friend_id = reader.read_u32()?;
+                    let status = decode_friend_status(reader.read_u8()?)?;
+                    let name = reader.read_null_terminated_utf8()?.to_string();
+                    friends.push(FriendInfo {
+                        character_id: friend_id,
+                        name,
+                        status,
+                    });
+                }
+                Ok(PacketServerMessenger::FriendList { friends })
+            }
+            0x08 => Ok(PacketServerMessenger::FriendStatusChanged {
+                friend_id: reader.read_u32()?,
+                status: decode_friend_status(reader.read_u8()?)?,
+            }),
+            _ => Err(PacketError::InvalidPacket),
+        }
+    }
+}
+
+impl<'a> From<&'a PacketServerMessenger<'a>> for Packet {
+    fn from(packet: &'a PacketServerMessenger<'a>) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::Messenger as u16);
+        match packet {
+            PacketServerMessenger::FriendAddRequest { requester_id, name } => {
+                writer.write_u8(0x01);
+                writer.write_u32(*requester_id);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerMessenger::FriendAdded { friend } => {
+                writer.write_u8(0x02);
+                writer.write_u32(friend.character_id);
+                writer.write_u8(encode_friend_status(friend.status));
+                writer.write_null_terminated_utf8(&friend.name);
+            }
+            PacketServerMessenger::FriendAddRejected { name } => {
+                writer.write_u8(0x03);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerMessenger::FriendAddTargetNotFound { name } => {
+                writer.write_u8(0x04);
+                writer.write_null_terminated_utf8(name);
+            }
+            PacketServerMessenger::FriendStatusChanged { friend_id, status } => {
+                writer.write_u8(0x08);
+                writer.write_u32(*friend_id);
+                writer.write_u8(encode_friend_status(*status));
+            }
+            PacketServerMessenger::FriendList { friends } => {
+                writer.write_u8(0x06);
+                writer.write_u8(friends.len() as u8);
+                for friend in friends {
+                    writer.write_u32(friend.character_id);
+                    writer.write_u8(encode_friend_status(friend.status));
+                    writer.write_null_terminated_utf8(&friend.name);
+                }
+            }
+        }
+        writer.into()
+    }
+}
+
+pub struct PacketServerMessengerChat<'a> {
+    pub friend_id: CharacterUniqueId,
+    pub text: &'a str,
+}
+
+impl<'a> TryFrom<&'a Packet> for PacketServerMessengerChat<'a> {
+    type Error = PacketError;
+
+    fn try_from(packet: &'a Packet) -> Result<Self, Self::Error> {
+        if packet.command != ServerPackets::MessengerChat as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let friend_id = reader.read_u32()?;
+        let text = reader.read_null_terminated_utf8()?;
+        Ok(PacketServerMessengerChat { friend_id, text })
+    }
+}
+
+impl<'a> From<&'a PacketServerMessengerChat<'a>> for Packet {
+    fn from(packet: &'a PacketServerMessengerChat<'a>) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::MessengerChat as u16);
+        writer.write_u32(packet.friend_id);
         writer.write_null_terminated_utf8(packet.text);
         writer.into()
     }
@@ -3213,6 +3394,7 @@ impl TryFrom<&Packet> for PacketServerCancelCastingSkill {
             1 => CancelCastingSkillReason::NeedAbility,
             2 => CancelCastingSkillReason::NeedTarget,
             3 => CancelCastingSkillReason::InvalidTarget,
+            4 => CancelCastingSkillReason::NeedSummonPoints,
             _ => return Err(PacketError::InvalidPacket),
         };
         Ok(Self { entity_id, reason })
@@ -3227,6 +3409,7 @@ impl From<&PacketServerCancelCastingSkill> for Packet {
             CancelCastingSkillReason::NeedAbility => writer.write_u8(1),
             CancelCastingSkillReason::NeedTarget => writer.write_u8(2),
             CancelCastingSkillReason::InvalidTarget => writer.write_u8(3),
+            CancelCastingSkillReason::NeedSummonPoints => writer.write_u8(4),
         }
         writer.into()
     }
@@ -3300,6 +3483,66 @@ impl From<&PacketServerUpdateSpeed> for Packet {
         writer.write_u16(packet.run_speed as u16);
         writer.write_u16(packet.passive_attack_speed as u16);
         writer.write_u8(0); // TODO: Weight rate
+        writer.into()
+    }
+}
+
+pub struct PacketServerUpdateSummonPoints {
+    pub used_points: u16,
+    pub max_points: u16,
+}
+
+impl TryFrom<&Packet> for PacketServerUpdateSummonPoints {
+    type Error = PacketError;
+
+    fn try_from(packet: &Packet) -> Result<Self, PacketError> {
+        if packet.command != ServerPackets::UpdateSummonPoints as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        Ok(Self {
+            used_points: reader.read_u16()?,
+            max_points: reader.read_u16()?,
+        })
+    }
+}
+
+impl From<&PacketServerUpdateSummonPoints> for Packet {
+    fn from(packet: &PacketServerUpdateSummonPoints) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::UpdateSummonPoints as u16);
+        writer.write_u16(packet.used_points);
+        writer.write_u16(packet.max_points);
+        writer.into()
+    }
+}
+
+pub struct PacketServerUpdateRecoveryRates {
+    pub hp_bonus: i32,
+    pub mp_bonus: i32,
+}
+
+impl TryFrom<&Packet> for PacketServerUpdateRecoveryRates {
+    type Error = PacketError;
+
+    fn try_from(packet: &Packet) -> Result<Self, PacketError> {
+        if packet.command != ServerPackets::UpdateRecoveryRates as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        Ok(Self {
+            hp_bonus: reader.read_i32()?,
+            mp_bonus: reader.read_i32()?,
+        })
+    }
+}
+
+impl From<&PacketServerUpdateRecoveryRates> for Packet {
+    fn from(packet: &PacketServerUpdateRecoveryRates) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::UpdateRecoveryRates as u16);
+        writer.write_i32(packet.hp_bonus);
+        writer.write_i32(packet.mp_bonus);
         writer.into()
     }
 }
@@ -3786,6 +4029,44 @@ impl From<&PacketServerPartyMemberRewardItem> for Packet {
     }
 }
 
+pub struct PacketServerPartyLevelXp {
+    pub level: u8,
+    pub xp: u32,
+    pub is_level_up: bool,
+}
+
+impl TryFrom<&Packet> for PacketServerPartyLevelXp {
+    type Error = PacketError;
+
+    fn try_from(packet: &Packet) -> Result<Self, PacketError> {
+        if packet.command != ServerPackets::PartyLevelXp as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let level = reader.read_u8()?;
+        let xp_and_flag = reader.read_u32()?;
+        let xp = xp_and_flag & 0x7FFF_FFFF;
+        let is_level_up = (xp_and_flag & 0x8000_0000) != 0;
+        Ok(Self {
+            level,
+            xp,
+            is_level_up,
+        })
+    }
+}
+
+impl From<&PacketServerPartyLevelXp> for Packet {
+    fn from(packet: &PacketServerPartyLevelXp) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::PartyLevelXp as u16);
+        writer.write_u8(packet.level);
+        let xp_and_flag =
+            (packet.xp & 0x7FFF_FFFF) | if packet.is_level_up { 0x8000_0000 } else { 0 };
+        writer.write_u32(xp_and_flag);
+        writer.into()
+    }
+}
+
 pub struct PacketServerChangeNpcId {
     pub entity_id: ClientEntityId,
     pub npc_id: NpcId,
@@ -3890,6 +4171,15 @@ pub enum PacketServerCraftItem {
     InsertGemSuccess {
         items: Vec<(ItemSlot, Option<Item>)>,
     },
+    UpgradeSuccess {
+        items: Vec<(ItemSlot, Option<Item>)>,
+    },
+    UpgradeFailed {
+        items: Vec<(ItemSlot, Option<Item>)>,
+    },
+    DisassembleSuccess {
+        items: Vec<(ItemSlot, Option<Item>)>,
+    },
 }
 
 impl TryFrom<&Packet> for PacketServerCraftItem {
@@ -3919,7 +4209,36 @@ impl TryFrom<&Packet> for PacketServerCraftItem {
             3 => Ok(Self::InsertGemFailed {
                 error: CraftInsertGemError::SocketFull,
             }),
-            // TODO: 4, 5, 6, 7, 16, 17, 18
+            7 => {
+                let num_items = reader.read_u8()? as usize;
+                let mut items = Vec::with_capacity(num_items);
+                for _ in 0..num_items {
+                    let item_slot = reader.read_item_slot_u8()?;
+                    let item = reader.read_item_full()?;
+                    items.push((item_slot, item));
+                }
+                Ok(Self::DisassembleSuccess { items })
+            }
+            16 => {
+                let num_items = reader.read_u8()? as usize;
+                let mut items = Vec::with_capacity(num_items);
+                for _ in 0..num_items {
+                    let item_slot = reader.read_item_slot_u8()?;
+                    let item = reader.read_item_full()?;
+                    items.push((item_slot, item));
+                }
+                Ok(Self::UpgradeSuccess { items })
+            }
+            17 => {
+                let num_items = reader.read_u8()? as usize;
+                let mut items = Vec::with_capacity(num_items);
+                for _ in 0..num_items {
+                    let item_slot = reader.read_item_slot_u8()?;
+                    let item = reader.read_item_full()?;
+                    items.push((item_slot, item));
+                }
+                Ok(Self::UpgradeFailed { items })
+            }
             _ => Err(PacketError::InvalidPacket),
         }
     }
@@ -3948,6 +4267,87 @@ impl From<&PacketServerCraftItem> for Packet {
                 error: CraftInsertGemError::SocketFull,
             } => {
                 writer.write_u8(3);
+            }
+            PacketServerCraftItem::DisassembleSuccess { items } => {
+                writer.write_u8(7);
+                writer.write_u8(items.len() as u8);
+                for (slot, item) in items.iter() {
+                    writer.write_item_slot_u8(*slot);
+                    writer.write_item_full(item.as_ref());
+                }
+            }
+            PacketServerCraftItem::UpgradeSuccess { items } => {
+                writer.write_u8(16);
+                writer.write_u8(items.len() as u8);
+                for (slot, item) in items.iter() {
+                    writer.write_item_slot_u8(*slot);
+                    writer.write_item_full(item.as_ref());
+                }
+            }
+            PacketServerCraftItem::UpgradeFailed { items } => {
+                writer.write_u8(17);
+                writer.write_u8(items.len() as u8);
+                for (slot, item) in items.iter() {
+                    writer.write_item_slot_u8(*slot);
+                    writer.write_item_full(item.as_ref());
+                }
+            }
+        }
+
+        writer.into()
+    }
+}
+
+#[derive(Debug)]
+pub enum PacketServerCreateItemResult {
+    Success {
+        inventory_slot: ItemSlot,
+        item: Item,
+    },
+    Failed {
+        error: u8,
+    },
+}
+
+impl TryFrom<&Packet> for PacketServerCreateItemResult {
+    type Error = PacketError;
+
+    fn try_from(packet: &Packet) -> Result<Self, Self::Error> {
+        if packet.command != ServerPackets::CreateItemResult as u16 {
+            return Err(PacketError::InvalidPacket);
+        }
+
+        let mut reader = PacketReader::from(packet);
+        let result = reader.read_u8()?;
+        match result {
+            0 => {
+                let item_slot = reader.read_item_slot_u16()?;
+                let item = reader.read_item_full()?.ok_or(PacketError::InvalidPacket)?;
+                Ok(Self::Success {
+                    inventory_slot: item_slot,
+                    item,
+                })
+            }
+            error => Ok(Self::Failed { error }),
+        }
+    }
+}
+
+impl From<&PacketServerCreateItemResult> for Packet {
+    fn from(packet: &PacketServerCreateItemResult) -> Self {
+        let mut writer = PacketWriter::new(ServerPackets::CreateItemResult as u16);
+
+        match packet {
+            PacketServerCreateItemResult::Success {
+                inventory_slot,
+                item,
+            } => {
+                writer.write_u8(0); // success
+                writer.write_item_slot_u16(*inventory_slot);
+                writer.write_item_full(Some(item));
+            }
+            PacketServerCreateItemResult::Failed { error } => {
+                writer.write_u8(*error);
             }
         }
 
@@ -4173,6 +4573,9 @@ pub enum PacketServerClanCommand {
     ClanInviteResult {
         response: ClanInviteResponse,
     },
+    ClanUpgradeResult {
+        result: ClanUpgradeResult,
+    },
     ClanMemberJoined {
         name: String,
     },
@@ -4266,6 +4669,27 @@ impl TryFrom<&Packet> for PacketServerClanCommand {
             }),
             0x44 => Ok(Self::ClanCreateError {
                 error: ClanCreateError::UnmetCondition,
+            }),
+            0x45 => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::Success,
+            }),
+            0x46 => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::NoClan,
+            }),
+            0x47 => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::NoPermission,
+            }),
+            0x48 => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::InvalidNpc,
+            }),
+            0x49 => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::NpcTooFar,
+            }),
+            0x4A => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::MaxLevel,
+            }),
+            0x4B => Ok(Self::ClanUpgradeResult {
+                result: ClanUpgradeResult::InsufficientPoints,
             }),
             0x71 => {
                 let id = ClanUniqueId::new(reader.read_u32()?).ok_or(PacketError::InvalidPacket)?;
@@ -4395,7 +4819,10 @@ impl TryFrom<&Packet> for PacketServerClanCommand {
             }
             0x82 => {
                 // RESULT_CLAN_QUIT: someone left or you were kicked
-                let name = reader.read_null_terminated_utf8().ok().map(|s| s.to_string());
+                let name = reader
+                    .read_null_terminated_utf8()
+                    .ok()
+                    .map(|s| s.to_string());
                 if let Some(name) = name {
                     Ok(Self::ClanMemberLeft { name })
                 } else {
@@ -4572,6 +4999,15 @@ impl From<&PacketServerClanCommand> for Packet {
                 ClanInviteResponse::TargetNotFound => writer.write_u8(0x63),
                 ClanInviteResponse::Rejected => writer.write_u8(0x63),
                 ClanInviteResponse::Accepted => writer.write_u8(0x63),
+            },
+            PacketServerClanCommand::ClanUpgradeResult { result } => match result {
+                ClanUpgradeResult::Success => writer.write_u8(0x45),
+                ClanUpgradeResult::NoClan => writer.write_u8(0x46),
+                ClanUpgradeResult::NoPermission => writer.write_u8(0x47),
+                ClanUpgradeResult::InvalidNpc => writer.write_u8(0x48),
+                ClanUpgradeResult::NpcTooFar => writer.write_u8(0x49),
+                ClanUpgradeResult::MaxLevel => writer.write_u8(0x4A),
+                ClanUpgradeResult::InsufficientPoints => writer.write_u8(0x4B),
             },
             PacketServerClanCommand::ClanMemberJoined { name } => {
                 writer.write_u8(0x61); // RESULT_CLAN_JOIN_MEMBER

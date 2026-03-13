@@ -18,15 +18,18 @@ use rose_data::{
 };
 use rose_game_common::{components::Money, data::Damage};
 
+use super::bonfire_aura_system::{create_bonfire_aura, is_bonfire_skill};
 use crate::game::{
     bundles::{ability_values_get_value, MonsterBundle, GLOBAL_SKILL_COOLDOWN},
     components::{
         AbilityValues, ClanMembership, ClientEntity, ClientEntityType, Cooldowns, Dead,
         ExperiencePoints, GameClient, HealthPoints, Inventory, Level, ManaPoints, MoveMode,
-        MoveSpeed, PartyMembership, Position, SpawnOrigin, Stamina, StatusEffects, Team,
+        MoveSpeed, PartyMembership, Position, SpawnOrigin, Stamina, StatusEffects, SummonPointCost,
+        SummonUsage, Team,
     },
     events::{DamageEvent, ItemLifeEvent, SkillEvent, SkillEventTarget},
     messages::server::{CancelCastingSkillReason, ServerMessage},
+    pvp::can_character_attack_character,
     resources::{ClientEntityList, ServerMessages},
     GameData,
 };
@@ -36,6 +39,7 @@ enum SkillCastError {
     InvalidSkill,
     InvalidTarget,
     NotEnoughUseAbility,
+    NotEnoughSummonPoints,
 }
 
 #[derive(SystemParam)]
@@ -51,6 +55,7 @@ pub struct SkillSystemParameters<'w, 's> {
 #[derive(SystemParam)]
 pub struct SkillSystemResources<'w, 's> {
     game_data: Res<'w, GameData>,
+    zone_list: Res<'w, crate::game::resources::ZoneList>,
     time: Res<'w, Time>,
 
     #[system_param(ignore)]
@@ -76,6 +81,7 @@ pub struct SkillCasterQuery<'w> {
     experience_points: Option<&'w mut ExperiencePoints>,
     cooldowns: Option<&'w mut Cooldowns>,
     inventory: Option<&'w mut Inventory>,
+    summon_usage: Option<&'w mut SummonUsage>,
 }
 
 #[derive(WorldQuery)]
@@ -102,6 +108,8 @@ pub struct SkillTargetQuery<'w> {
 
 // TODO: Deduplicate code with skill_use.rs check_skill_target_filter
 fn check_skill_target_filter(
+    game_data: &GameData,
+    zone_list: &crate::game::resources::ZoneList,
     skill_caster: &SkillCasterQueryItem,
     skill_target: &SkillTargetQueryItem,
     skill_data: &SkillData,
@@ -142,11 +150,73 @@ fn check_skill_target_filter(
                 )
         }
         SkillTargetFilter::Enemy => {
+            if target_is_alive
+                && matches!(
+                    skill_caster.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+                && matches!(
+                    skill_target.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+            {
+                if target_is_caster {
+                    return false;
+                }
+
+                if skill_caster.position.zone_id != skill_target.position.zone_id {
+                    return false;
+                }
+
+                let Some(zone_data) = game_data.zones.get_zone(skill_caster.position.zone_id)
+                else {
+                    return false;
+                };
+
+                return can_character_attack_character(
+                    zone_data,
+                    zone_list.get_pvp_enabled(skill_caster.position.zone_id),
+                    skill_caster.team.id,
+                    skill_target.team.id,
+                );
+            }
+
             target_is_alive
                 && skill_target.team.id != Team::DEFAULT_NPC_TEAM_ID
                 && skill_caster.team.id != skill_target.team.id
         }
         SkillTargetFilter::EnemyCharacter => {
+            if target_is_alive
+                && matches!(
+                    skill_caster.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+                && matches!(
+                    skill_target.client_entity.entity_type,
+                    ClientEntityType::Character
+                )
+            {
+                if target_is_caster {
+                    return false;
+                }
+
+                if skill_caster.position.zone_id != skill_target.position.zone_id {
+                    return false;
+                }
+
+                let Some(zone_data) = game_data.zones.get_zone(skill_caster.position.zone_id)
+                else {
+                    return false;
+                };
+
+                return can_character_attack_character(
+                    zone_data,
+                    zone_list.get_pvp_enabled(skill_caster.position.zone_id),
+                    skill_caster.team.id,
+                    skill_target.team.id,
+                );
+            }
+
             target_is_alive
                 && skill_caster.team.id != skill_target.team.id
                 && matches!(
@@ -195,7 +265,13 @@ fn apply_skill_status_effects_to_entity(
     skill_target: &mut SkillTargetQueryItem,
     skill_data: &SkillData,
 ) -> Result<(), SkillCastError> {
-    if !check_skill_target_filter(skill_caster, skill_target, skill_data) {
+    if !check_skill_target_filter(
+        &skill_system_resources.game_data,
+        &skill_system_resources.zone_list,
+        skill_caster,
+        skill_target,
+        skill_data,
+    ) {
         return Err(SkillCastError::InvalidTarget);
     }
 
@@ -439,7 +515,13 @@ fn apply_skill_damage_to_entity(
     skill_target: &mut SkillTargetQueryItem,
     skill_data: &SkillData,
 ) -> Result<Damage, SkillCastError> {
-    if !check_skill_target_filter(skill_caster, skill_target, skill_data) {
+    if !check_skill_target_filter(
+        &skill_system_resources.game_data,
+        &skill_system_resources.zone_list,
+        skill_caster,
+        skill_target,
+        skill_data,
+    ) {
         return Err(SkillCastError::InvalidTarget);
     }
 
@@ -781,45 +863,86 @@ pub fn skill_effect_system(
                 }
                 SkillType::SummonPet => {
                     if let Some(npc_id) = skill_data.summon_npc_id {
-                        if let Some(entity) = MonsterBundle::spawn(
-                            &mut commands,
-                            &mut client_entity_list,
-                            &skill_system_resources.game_data,
-                            npc_id,
-                            skill_caster.position.zone_id,
-                            SpawnOrigin::Summoned(
-                                skill_caster.entity,
-                                skill_caster.position.position,
-                            ),
-                            150,
-                            skill_caster.team.clone(),
-                            Some((skill_caster.entity, skill_caster.level)),
-                            Some(skill_data.level as i32),
-                        ) {
-                            // Apply status effect to decrease summon's life over time
-                            if let Some(status_effect_data) = skill_system_resources
-                                .game_data
-                                .status_effects
-                                .get_decrease_summon_life_status_effect()
-                            {
-                                let mut status_effects = StatusEffects::new();
-                                status_effects
-                                    .apply_summon_decrease_life_status_effect(status_effect_data);
-                                commands.entity(entity).insert(status_effects);
-                            }
+                        match skill_system_resources.game_data.npcs.get_npc(npc_id) {
+                            Some(summon_npc_data) => {
+                                let summon_point_requirement =
+                                    summon_npc_data.summon_point_requirement;
+                                let used_points = skill_caster
+                                    .summon_usage
+                                    .as_ref()
+                                    .map_or(0, |summon_usage| summon_usage.used_points);
+                                let max_points =
+                                    skill_caster.ability_values.get_max_summon_points();
+                                if summon_point_requirement > 0
+                                    && used_points.saturating_add(summon_point_requirement)
+                                        > max_points
+                                {
+                                    Err(SkillCastError::NotEnoughSummonPoints)
+                                } else if let Some(entity) = MonsterBundle::spawn(
+                                    &mut commands,
+                                    &mut client_entity_list,
+                                    &skill_system_resources.game_data,
+                                    npc_id,
+                                    skill_caster.position.zone_id,
+                                    SpawnOrigin::Summoned(
+                                        skill_caster.entity,
+                                        skill_caster.position.position,
+                                    ),
+                                    150,
+                                    skill_caster.team.clone(),
+                                    Some((skill_caster.entity, skill_caster.level)),
+                                    Some(skill_data.level as i32),
+                                ) {
+                                    // Apply status effect to decrease summon's life over time
+                                    if let Some(status_effect_data) = skill_system_resources
+                                        .game_data
+                                        .status_effects
+                                        .get_decrease_summon_life_status_effect()
+                                    {
+                                        let mut status_effects = StatusEffects::new();
+                                        status_effects.apply_summon_decrease_life_status_effect(
+                                            status_effect_data,
+                                        );
+                                        commands.entity(entity).insert(status_effects);
+                                    }
 
-                            let summon_point_requirement = skill_system_resources
-                                .game_data
-                                .npcs
-                                .get_npc(npc_id)
-                                .map_or(0, |npc_data| npc_data.summon_point_requirement);
-                            if summon_point_requirement > 0 {
-                                // TODO: Update summon points
-                            }
+                                    if summon_point_requirement > 0 {
+                                        if let Some(summon_usage) =
+                                            skill_caster.summon_usage.as_deref_mut()
+                                        {
+                                            summon_usage.used_points = summon_usage
+                                                .used_points
+                                                .saturating_add(summon_point_requirement);
+                                        }
+                                        commands
+                                            .entity(entity)
+                                            .insert(SummonPointCost::new(summon_point_requirement));
+                                    }
 
-                            Ok(())
-                        } else {
-                            Err(SkillCastError::InvalidSkill)
+                                    if is_bonfire_skill(skill_data) {
+                                        commands.entity(entity).insert(create_bonfire_aura(
+                                            &skill_system_resources.game_data,
+                                            skill_data,
+                                            skill_caster.entity,
+                                            skill_caster.party_membership.and_then(
+                                                |party_membership| party_membership.party,
+                                            ),
+                                        ));
+                                    }
+
+                                    Ok(())
+                                } else {
+                                    Err(SkillCastError::InvalidSkill)
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    "Unable to summon NPC {} for skill {} because NPC data was not found",
+                                    npc_id.get(),
+                                    skill_data.id.get()
+                                );
+                                Err(SkillCastError::InvalidSkill)
+                            }
                         }
                     } else {
                         Err(SkillCastError::InvalidSkill)
@@ -895,6 +1018,9 @@ pub fn skill_effect_system(
                         reason: match error {
                             SkillCastError::NotEnoughUseAbility => {
                                 CancelCastingSkillReason::NeedAbility
+                            }
+                            SkillCastError::NotEnoughSummonPoints => {
+                                CancelCastingSkillReason::NeedSummonPoints
                             }
                             _ => CancelCastingSkillReason::NeedTarget,
                         },

@@ -6,7 +6,8 @@ use bevy::ecs::{
 
 use crate::game::{
     components::{
-        AbilityValues, BasicStats, CharacterInfo, Equipment, Level, SkillList, StatusEffects,
+        AbilityValues, BasicStats, CharacterInfo, Equipment, Level, RecoveryRateBonus, SkillList,
+        StatusEffects,
     },
     GameData,
 };
@@ -19,6 +20,7 @@ pub struct AbilityValuesCharacterQuery<'w> {
     character_info: &'w CharacterInfo,
     equipment: &'w Equipment,
     level: &'w Level,
+    recovery_rate_bonus: Option<&'w RecoveryRateBonus>,
     skill_list: &'w SkillList,
     status_effects: &'w StatusEffects,
 }
@@ -32,6 +34,7 @@ pub fn ability_values_update_character_system(
             Changed<Equipment>,
             Changed<BasicStats>,
             Changed<SkillList>,
+            Changed<RecoveryRateBonus>,
             Changed<StatusEffects>,
         )>,
     >,
@@ -46,5 +49,9 @@ pub fn ability_values_update_character_system(
             character.skill_list,
             character.status_effects,
         );
+        if let Some(recovery_rate_bonus) = character.recovery_rate_bonus {
+            character.ability_values.additional_health_recovery += recovery_rate_bonus.hp_bonus;
+            character.ability_values.additional_mana_recovery += recovery_rate_bonus.mp_bonus;
+        }
     }
 }

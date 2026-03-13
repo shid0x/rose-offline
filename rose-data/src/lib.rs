@@ -71,6 +71,7 @@ mod item_database;
 mod job_class_database;
 mod motion_file_data;
 mod npc_database;
+mod product_database;
 mod quest_database;
 mod skill_database;
 mod skybox_database;
@@ -111,6 +112,7 @@ pub use npc_database::{
     NpcConversationData, NpcConversationId, NpcData, NpcDatabase, NpcDatabaseOptions, NpcId,
     NpcMotionAction, NpcStoreTabData, NpcStoreTabId,
 };
+pub use product_database::{ProductData, ProductDatabase, ProductMaterial};
 pub use quest_database::{QuestData, QuestDatabase, QuestTrigger, QuestTriggerHash};
 pub use skill_database::{
     SkillActionMode, SkillAddAbility, SkillBasicCommand, SkillCastingEffect, SkillCooldown,

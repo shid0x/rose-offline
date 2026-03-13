@@ -1,6 +1,6 @@
 use bevy::{
     ecs::{
-        prelude::{Commands, Entity, EventWriter, Query, Res, ResMut, Without},
+        prelude::{Commands, Entity, EventWriter, Query, Res, ResMut, Without, World},
         query::WorldQuery,
         system::SystemParam,
     },
@@ -8,11 +8,23 @@ use bevy::{
     time::Time,
 };
 use log::warn;
+use std::collections::HashSet;
 
-use rose_data::{EquipmentIndex, Item, ItemClass, ItemSlotBehaviour, ItemType};
+use rose_data::{
+    AbilityType, EquipmentIndex, EquipmentItem, Item, ItemClass, ItemReference, ItemSlotBehaviour,
+    ItemType, SkillType, StackableItem,
+};
 use rose_game_common::{
+    components::CharacterUniqueId,
     data::Password,
-    messages::server::{CharacterData, CharacterDataItems, CraftInsertGemError},
+    data::{
+        disassemble_from_npc_price, manufacture_required_mp, manufacture_success_chance,
+        upgrade_from_npc_price,
+    },
+    messages::{
+        server::{CharacterData, CharacterDataItems, CraftCreateItemError, CraftInsertGemError},
+        Friend, FriendInfo, FriendStatus,
+    },
 };
 
 use crate::game::{
@@ -24,10 +36,11 @@ use crate::game::{
         AbilityValues, Account, Bank, BasicStatType, BasicStats, CharacterInfo, Clan, ClanMember,
         ClanMembership, ClientEntity, ClientEntitySector, ClientEntityType, ClientEntityVisibility,
         Command, CommandData, Cooldowns, DamageSources, Dead, DrivingTime, DroppedItem, Equipment,
-        EquipmentItemDatabase, ExperiencePoints, GameClient, HealthPoints, Hotbar, Inventory,
-        ItemSlot, Level, ManaPoints, Money, MotionData, MoveMode, MoveSpeed, NextCommand, Party,
-        PartyMember, PartyMembership, PassiveRecoveryTime, PersonalStore, Position, QuestState,
-        SkillList, SkillPoints, StatPoints, StatusEffects, StatusEffectsRegen, Team, WorldClient,
+        EquipmentItemDatabase, ExperiencePoints, FriendList, GameClient, HealthPoints, Hotbar,
+        Inventory, ItemSlot, Level, ManaPoints, Money, MotionData, MoveMode, MoveSpeed,
+        NextCommand, Party, PartyMember, PartyMembership, PassiveRecoveryTime, PersonalStore,
+        Position, QuestState, RecoveryRateBonus, SkillList, SkillPoints, StatPoints, StatusEffects,
+        StatusEffectsRegen, Team, WorldClient,
     },
     events::{
         BankEvent, ChatCommandEvent, ClanEvent, EquipmentEvent, ItemLifeEvent, NpcStoreEvent,
@@ -38,14 +51,262 @@ use crate::game::{
         client::ClientMessage,
         server::{ConnectionRequestError, ServerMessage},
     },
-    resources::{ClientEntityList, GameData, LoginTokens, ServerMessages, WorldRates, WorldTime},
+    pvp::join_zone_global_flags,
+    resources::{
+        ClientEntityList, GameData, LoginTokens, OnlineFriends, ServerMessages, WorldRates,
+        WorldTime,
+    },
     storage::{account::AccountStorage, bank::BankStorage, character::CharacterStorage},
 };
+
+#[derive(Copy, Clone)]
+enum ResolvedCraftMaterialRequirement {
+    Item(ItemReference),
+    ItemClass(ItemClass),
+    Unknown,
+}
+
+#[derive(Copy, Clone)]
+struct UpgradeMaterialRequirement {
+    quantity: u32,
+    requirement: ResolvedCraftMaterialRequirement,
+}
+
+fn resolve_craft_material_requirement(
+    game_data: &GameData,
+    required_item: ItemReference,
+) -> ResolvedCraftMaterialRequirement {
+    if game_data.items.get_base_item(required_item).is_some() {
+        return ResolvedCraftMaterialRequirement::Item(required_item);
+    }
+
+    if let Some(item_class) = game_data
+        .data_decoder
+        .decode_item_class(required_item.item_number)
+    {
+        return ResolvedCraftMaterialRequirement::ItemClass(item_class);
+    }
+
+    ResolvedCraftMaterialRequirement::Unknown
+}
+
+fn resolve_upgrade_product_row_id(target_item: ItemReference, grade: u8) -> Option<u32> {
+    if !target_item.item_type.is_equipment_item() {
+        return None;
+    }
+
+    let base_row = match target_item.item_type {
+        ItemType::Weapon => 1u32,
+        _ => 11u32,
+    };
+    Some(base_row + grade as u32)
+}
+
+fn build_upgrade_material_requirements(
+    game_data: &GameData,
+    target_item: ItemReference,
+    grade: u8,
+) -> Option<[Option<UpgradeMaterialRequirement>; 3]> {
+    let mut requirements = [None, None, None];
+    let product_row_id = resolve_upgrade_product_row_id(target_item, grade)?;
+    let product = game_data.products.get_product(product_row_id)?;
+
+    if let Some(material) = product.materials.get(0) {
+        let requirement = if product.raw_material_type > 0 {
+            game_data
+                .data_decoder
+                .decode_item_class(product.raw_material_type as usize)
+                .map(ResolvedCraftMaterialRequirement::ItemClass)
+                .unwrap_or_else(|| resolve_craft_material_requirement(game_data, material.item))
+        } else {
+            resolve_craft_material_requirement(game_data, material.item)
+        };
+        requirements[0] = Some(UpgradeMaterialRequirement {
+            quantity: material.quantity,
+            requirement,
+        });
+    }
+
+    if let Some(material) = product.materials.get(1) {
+        requirements[1] = Some(UpgradeMaterialRequirement {
+            quantity: material.quantity,
+            requirement: resolve_craft_material_requirement(game_data, material.item),
+        });
+    }
+
+    if let Some(material) = product.materials.get(2) {
+        requirements[2] = Some(UpgradeMaterialRequirement {
+            quantity: material.quantity,
+            requirement: resolve_craft_material_requirement(game_data, material.item),
+        });
+    }
+
+    Some(requirements)
+}
+
+fn validate_upgrade_materials(
+    game_data: &GameData,
+    inventory: &Inventory,
+    target_item: ItemReference,
+    grade: u8,
+    ingredients: &[ItemSlot; 3],
+) -> Result<[u32; 3], &'static str> {
+    let requirements = build_upgrade_material_requirements(game_data, target_item, grade)
+        .ok_or("missing upgrade requirement row")?;
+    let mut required_quantities = [0u32; 3];
+
+    for (row_index, requirement) in requirements.iter().enumerate() {
+        let Some(requirement) = requirement else {
+            continue;
+        };
+        required_quantities[row_index] = requirement.quantity;
+
+        let Some(inv_item) = inventory.get_item(ingredients[row_index]) else {
+            return Err("missing ingredient item");
+        };
+
+        let has_enough = match (inv_item, requirement.requirement) {
+            (Item::Stackable(s), ResolvedCraftMaterialRequirement::Item(item)) => {
+                s.item == item && s.quantity >= requirement.quantity
+            }
+            (Item::Stackable(s), ResolvedCraftMaterialRequirement::ItemClass(required_class)) => {
+                s.quantity >= requirement.quantity
+                    && game_data
+                        .items
+                        .get_base_item(s.item)
+                        .map_or(false, |item_data| item_data.class == required_class)
+            }
+            (_, ResolvedCraftMaterialRequirement::Unknown) => false,
+            _ => false,
+        };
+
+        if !has_enough {
+            return Err("ingredient mismatch");
+        }
+    }
+
+    // Prevent duplicate-slot bypass by applying required consumption on a cloned inventory.
+    let mut simulated_inventory = inventory.clone();
+    for (row_index, required_quantity) in required_quantities.iter().enumerate() {
+        if *required_quantity == 0 {
+            continue;
+        }
+        if simulated_inventory
+            .try_take_quantity(ingredients[row_index], *required_quantity)
+            .is_none()
+        {
+            return Err("insufficient aggregate quantity");
+        }
+    }
+
+    Ok(required_quantities)
+}
+
+fn resolve_upgrade_required_mp(game_data: &GameData, skill_list: &SkillList) -> Option<i32> {
+    for page in &skill_list.pages {
+        for skill_id in page.skills.iter().flatten() {
+            let Some(skill_data) = game_data.skills.get_skill(*skill_id) else {
+                continue;
+            };
+
+            if skill_data.skill_type == SkillType::CreateWindow && skill_data.item_make_number == 42
+            {
+                return Some(manufacture_required_mp(skill_data));
+            }
+        }
+    }
+
+    None
+}
+
+fn collect_craft_material_inventory_updates(
+    inventory: &Inventory,
+    material_inventory_slots: &[ItemSlot],
+) -> Vec<(ItemSlot, Option<Item>)> {
+    let mut seen_slots = HashSet::new();
+    let mut updates = Vec::new();
+
+    for &slot in material_inventory_slots {
+        if seen_slots.insert(slot) {
+            updates.push((slot, inventory.get_item(slot).cloned()));
+        }
+    }
+
+    updates
+}
+
+fn contains_friend(friends: &[Friend], character_id: CharacterUniqueId) -> bool {
+    friends
+        .iter()
+        .any(|friend| friend.character_id == character_id)
+}
+
+fn friend_status_from_online(
+    online_friends: &OnlineFriends,
+    character_id: CharacterUniqueId,
+) -> FriendStatus {
+    if online_friends.get_by_id(character_id).is_some() {
+        FriendStatus::Online
+    } else {
+        FriendStatus::Offline
+    }
+}
+
+fn build_friend_infos(online_friends: &OnlineFriends, friends: &[Friend]) -> Vec<FriendInfo> {
+    friends
+        .iter()
+        .map(|friend| FriendInfo {
+            character_id: friend.character_id,
+            name: friend.name.clone(),
+            status: friend_status_from_online(online_friends, friend.character_id),
+        })
+        .collect()
+}
+
+fn should_fire_zone_join_trigger(zone_id: rose_data::ZoneId) -> bool {
+    // Lion's Plain is an event-only PvP map. Outside its original event flow, the join trigger
+    // immediately redirects the player back to Junon, which makes GM/debug teleports unusable.
+    zone_id.get() != 8
+}
+
+fn send_friend_status_to_online_friends(
+    world: &mut World,
+    current_id: CharacterUniqueId,
+    current_friends: &[Friend],
+    status: FriendStatus,
+) {
+    let recipient_entities = {
+        let online_friends = world.resource::<OnlineFriends>();
+        current_friends
+            .iter()
+            .filter_map(|friend| online_friends.get_by_id(friend.character_id))
+            .map(|online_friend| online_friend.entity)
+            .collect::<Vec<_>>()
+    };
+
+    let mut query = world.query::<(&FriendList, &GameClient)>();
+    for recipient_entity in recipient_entities {
+        if let Ok((recipient_friend_list, recipient_game_client)) =
+            query.get(world, recipient_entity)
+        {
+            if contains_friend(&recipient_friend_list.friends, current_id) {
+                recipient_game_client
+                    .server_message_tx
+                    .send(ServerMessage::FriendStatusChanged {
+                        friend_id: current_id,
+                        status,
+                    })
+                    .ok();
+            }
+        }
+    }
+}
 
 fn handle_game_connection_request(
     commands: &mut Commands,
     game_data: &GameData,
     login_tokens: &mut LoginTokens,
+    online_friends: &mut OnlineFriends,
     entity: Entity,
     game_client: &mut GameClient,
     token_id: u32,
@@ -194,7 +455,12 @@ fn handle_game_connection_request(
     let move_mode = MoveMode::Run;
     let move_speed = MoveSpeed::new(ability_values.get_move_speed(&move_mode));
 
+    online_friends.insert(character.info.unique_id, &character.info.name, entity, None);
+
     commands.entity(entity).insert((
+        FriendList {
+            friends: character.friends.clone(),
+        },
         account,
         CharacterBundle {
             ability_values,
@@ -219,12 +485,14 @@ fn handle_game_connection_request(
             passive_recovery_time: PassiveRecoveryTime::default(),
             position: position.clone(),
             quest_state: character.quest_state.clone(),
+            recovery_rate_bonus: RecoveryRateBonus::default(),
             skill_list: character.skill_list.clone(),
             skill_points: character.skill_points,
             stamina: character.stamina,
             stat_points: character.stat_points,
             status_effects,
             status_effects_regen,
+            summon_usage: Default::default(),
             team: Team::default_character(),
             union_membership: character.union_membership.clone(),
             clan_membership,
@@ -264,6 +532,7 @@ pub fn game_server_authentication_system(
     mut query_world_client: Query<&mut WorldClient>,
     mut query_clans: Query<(Entity, &mut Clan)>,
     mut login_tokens: ResMut<LoginTokens>,
+    mut online_friends: ResMut<OnlineFriends>,
     game_data: Res<GameData>,
 ) {
     query.for_each_mut(|(entity, mut game_client)| {
@@ -277,6 +546,7 @@ pub fn game_server_authentication_system(
                         &mut commands,
                         game_data.as_ref(),
                         login_tokens.as_mut(),
+                        online_friends.as_mut(),
                         entity,
                         game_client.as_mut(),
                         login_token,
@@ -331,100 +601,158 @@ pub fn game_server_authentication_system(
 
 pub fn game_server_join_system(
     mut commands: Commands,
-    query: Query<
+    mut query: Query<
         (
             Entity,
             &GameClient,
             &CharacterInfo,
             &ExperiencePoints,
-            &Team,
+            &mut Team,
             &HealthPoints,
             &ManaPoints,
             &Position,
+            &FriendList,
         ),
         Without<ClientEntity>,
     >,
     mut client_entity_list: ResMut<ClientEntityList>,
+    mut online_friends: ResMut<OnlineFriends>,
+    game_data: Res<GameData>,
+    mut quest_trigger_events: EventWriter<QuestTriggerEvent>,
     world_rates: Res<WorldRates>,
     world_time: Res<WorldTime>,
+    zone_list: Res<crate::game::resources::ZoneList>,
     mut party_query: Query<(Entity, &mut Party)>,
     mut party_member_events: EventWriter<PartyMemberEvent>,
 ) {
-    query.for_each(
-        |(
-            entity,
-            game_client,
-            character_info,
-            experience_points,
-            team,
-            health_points,
-            mana_points,
-            position,
-        )| {
-            if let Ok(message) = game_client.client_message_rx.try_recv() {
-                match message {
-                    ClientMessage::JoinZoneRequest => {
-                        if let Ok(entity_id) = client_entity_join_zone(
-                            &mut commands,
-                            &mut client_entity_list,
-                            entity,
-                            ClientEntityType::Character,
-                            position,
-                        ) {
-                            // See if we are in a party as an offline member
-                            let mut party_membership = PartyMembership::default();
-                            for (party_entity, mut party) in party_query.iter_mut() {
-                                for party_member in party.members.iter_mut() {
-                                    if let PartyMember::Offline(
-                                        party_member_character_id,
-                                        party_member_name,
-                                    ) = party_member
+    for (
+        entity,
+        game_client,
+        character_info,
+        experience_points,
+        mut team,
+        health_points,
+        mana_points,
+        position,
+        friend_list,
+    ) in query.iter_mut()
+    {
+        if let Ok(message) = game_client.client_message_rx.try_recv() {
+            match message {
+                ClientMessage::JoinZoneRequest => {
+                    if let Ok(entity_id) = client_entity_join_zone(
+                        &mut commands,
+                        &mut client_entity_list,
+                        entity,
+                        ClientEntityType::Character,
+                        position,
+                    ) {
+                        // See if we are in a party as an offline member
+                        let mut reconnected_party_membership = None;
+                        for (party_entity, mut party) in party_query.iter_mut() {
+                            for party_member in party.members.iter_mut() {
+                                if let PartyMember::Offline(
+                                    party_member_character_id,
+                                    party_member_name,
+                                ) = party_member
+                                {
+                                    if *party_member_character_id == character_info.unique_id
+                                        && party_member_name == &character_info.name
                                     {
-                                        if *party_member_character_id == character_info.unique_id
-                                            && party_member_name == &character_info.name
-                                        {
-                                            *party_member = PartyMember::Online(entity);
-                                            party_membership = PartyMembership::new(party_entity);
-                                            party_member_events.send(PartyMemberEvent::Reconnect {
-                                                party_entity,
-                                                reconnect_entity: entity,
-                                                character_id: character_info.unique_id,
-                                                name: character_info.name.clone(),
-                                            });
-                                            break;
-                                        }
+                                        *party_member = PartyMember::Online(entity);
+                                        reconnected_party_membership =
+                                            Some(PartyMembership::new(party_entity));
+                                        party_member_events.send(PartyMemberEvent::Reconnect {
+                                            party_entity,
+                                            reconnect_entity: entity,
+                                            character_id: character_info.unique_id,
+                                            name: character_info.name.clone(),
+                                        });
+                                        break;
                                     }
                                 }
                             }
-
-                            commands
-                                .entity(entity)
-                                .insert(party_membership)
-                                .insert(ClientEntityVisibility::new())
-                                .insert(PassiveRecoveryTime::default());
-
-                            game_client
-                                .server_message_tx
-                                .send(ServerMessage::JoinZone {
-                                    entity_id,
-                                    experience_points: *experience_points,
-                                    team: team.clone(),
-                                    health_points: *health_points,
-                                    mana_points: *mana_points,
-                                    world_ticks: world_time.ticks,
-                                    craft_rate: world_rates.craft_rate,
-                                    world_price_rate: world_rates.world_price_rate,
-                                    item_price_rate: world_rates.item_price_rate,
-                                    town_price_rate: world_rates.town_price_rate,
-                                })
-                                .ok();
                         }
+
+                        // Only overwrite PartyMembership if reconnecting
+                        // from offline; otherwise keep existing membership
+                        if let Some(party_membership) = reconnected_party_membership {
+                            commands.entity(entity).insert(party_membership);
+                        }
+
+                        commands
+                            .entity(entity)
+                            .insert(ClientEntityVisibility::new())
+                            .insert(PassiveRecoveryTime::default());
+
+                        online_friends.update_client_entity_id(character_info.unique_id, entity_id);
+                        *team = Team::default_character();
+
+                        if let Some(zone_data) = game_data.zones.get_zone(position.zone_id) {
+                            if let Some(join_trigger) = zone_data.join_trigger.as_ref() {
+                                if should_fire_zone_join_trigger(position.zone_id) {
+                                    quest_trigger_events.send(QuestTriggerEvent {
+                                        trigger_entity: entity,
+                                        trigger_hash: join_trigger.as_str().into(),
+                                    });
+                                }
+                            }
+                        }
+
+                        let global_flags = game_data
+                            .zones
+                            .get_zone(position.zone_id)
+                            .map(|zone_data| {
+                                join_zone_global_flags(
+                                    zone_data,
+                                    zone_list.get_pvp_enabled(position.zone_id),
+                                )
+                            })
+                            .unwrap_or(0);
+
+                        game_client
+                            .server_message_tx
+                            .send(ServerMessage::JoinZone {
+                                entity_id,
+                                experience_points: *experience_points,
+                                team: team.clone(),
+                                global_flags,
+                                health_points: *health_points,
+                                mana_points: *mana_points,
+                                world_ticks: world_time.ticks,
+                                craft_rate: world_rates.craft_rate,
+                                world_price_rate: world_rates.world_price_rate,
+                                item_price_rate: world_rates.item_price_rate,
+                                town_price_rate: world_rates.town_price_rate,
+                            })
+                            .ok();
+
+                        game_client
+                            .server_message_tx
+                            .send(ServerMessage::FriendList {
+                                friends: build_friend_infos(
+                                    online_friends.as_ref(),
+                                    &friend_list.friends,
+                                ),
+                            })
+                            .ok();
+
+                        let current_id = character_info.unique_id;
+                        let current_friends = friend_list.friends.clone();
+                        commands.add(move |world: &mut World| {
+                            send_friend_status_to_online_friends(
+                                world,
+                                current_id,
+                                &current_friends,
+                                FriendStatus::Online,
+                            );
+                        });
                     }
-                    _ => warn!("Received unexpected client message {:?}", message),
                 }
+                _ => warn!("Received unexpected client message {:?}", message),
             }
-        },
-    );
+        }
+    }
 }
 
 #[derive(WorldQuery)]
@@ -442,6 +770,7 @@ pub struct GameClientQuery<'w> {
     level: &'w Level,
     move_speed: &'w MoveSpeed,
     team: &'w Team,
+    friend_list: &'w FriendList,
     basic_stats: &'w mut BasicStats,
     character_info: &'w mut CharacterInfo,
     stat_points: &'w mut StatPoints,
@@ -452,6 +781,7 @@ pub struct GameClientQuery<'w> {
     inventory: &'w mut Inventory,
     quest_state: &'w mut QuestState,
     move_mode: &'w mut MoveMode,
+    mana_points: &'w mut ManaPoints,
 }
 
 #[derive(SystemParam)]
@@ -477,6 +807,8 @@ pub fn game_server_main_system(
     mut client_entity_list: ResMut<ClientEntityList>,
     mut server_messages: ResMut<ServerMessages>,
     game_data: Res<GameData>,
+    online_friends: Res<OnlineFriends>,
+    world_rates: Res<WorldRates>,
     time: Res<Time>,
 ) {
     for mut game_client in game_client_query.iter_mut() {
@@ -498,6 +830,306 @@ pub fn game_server_main_system(
                             },
                         );
                     }
+                }
+                ClientMessage::FriendListRequest => {
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::FriendList {
+                            friends: build_friend_infos(
+                                online_friends.as_ref(),
+                                &game_client.friend_list.friends,
+                            ),
+                        })
+                        .ok();
+                }
+                ClientMessage::FriendAdd { name } => {
+                    let sender_entity = game_client.entity;
+                    let target_name = name.trim().to_string();
+                    commands.add(move |world: &mut World| {
+                        if target_name.is_empty() {
+                            return;
+                        }
+
+                        let mut query = world.query::<(&CharacterInfo, &FriendList, &GameClient)>();
+                        let Ok((sender_info, sender_friend_list, sender_game_client)) =
+                            query.get(world, sender_entity)
+                        else {
+                            return;
+                        };
+
+                        if sender_info.name.eq_ignore_ascii_case(&target_name)
+                            || contains_friend(&sender_friend_list.friends, sender_info.unique_id)
+                        {
+                            return;
+                        }
+
+                        if sender_friend_list
+                            .friends
+                            .iter()
+                            .any(|friend| friend.name.eq_ignore_ascii_case(&target_name))
+                        {
+                            return;
+                        }
+
+                        let target_online = {
+                            let online_friends = world.resource::<OnlineFriends>();
+                            online_friends.get_by_name(&target_name)
+                        };
+
+                        let Some(target_online) = target_online else {
+                            sender_game_client
+                                .server_message_tx
+                                .send(ServerMessage::FriendAddTargetNotFound {
+                                    name: target_name.clone(),
+                                })
+                                .ok();
+                            return;
+                        };
+
+                        if target_online.entity == sender_entity {
+                            return;
+                        }
+
+                        if let Ok((_, _, target_game_client)) =
+                            query.get(world, target_online.entity)
+                        {
+                            target_game_client
+                                .server_message_tx
+                                .send(ServerMessage::FriendAddRequest {
+                                    requester_id: sender_info.unique_id,
+                                    name: sender_info.name.clone(),
+                                })
+                                .ok();
+                        }
+                    });
+                }
+                ClientMessage::FriendAddResponse {
+                    requester_id,
+                    accept,
+                } => {
+                    let responder_entity = game_client.entity;
+                    commands.add(move |world: &mut World| {
+                        let requester_online = {
+                            let online_friends = world.resource::<OnlineFriends>();
+                            online_friends.get_by_id(requester_id)
+                        };
+
+                        let Some(requester_online) = requester_online else {
+                            return;
+                        };
+
+                        let (
+                            responder_id,
+                            responder_name,
+                            responder_server_message_tx,
+                            requester_name,
+                            requester_server_message_tx,
+                        ) = {
+                            let mut info_query = world.query::<(&CharacterInfo, &GameClient)>();
+                            let Ok((responder_info, responder_game_client)) =
+                                info_query.get(world, responder_entity)
+                            else {
+                                return;
+                            };
+                            let Ok((requester_info, requester_game_client)) =
+                                info_query.get(world, requester_online.entity)
+                            else {
+                                return;
+                            };
+
+                            (
+                                responder_info.unique_id,
+                                responder_info.name.clone(),
+                                responder_game_client.server_message_tx.clone(),
+                                requester_info.name.clone(),
+                                requester_game_client.server_message_tx.clone(),
+                            )
+                        };
+
+                        if !accept {
+                            requester_server_message_tx
+                                .send(ServerMessage::FriendAddRejected {
+                                    name: responder_name,
+                                })
+                                .ok();
+                            return;
+                        }
+
+                        if let Some(mut responder_friend_list) =
+                            world.get_mut::<FriendList>(responder_entity)
+                        {
+                            if !contains_friend(&responder_friend_list.friends, requester_id) {
+                                responder_friend_list.friends.push(Friend {
+                                    character_id: requester_id,
+                                    name: requester_name.clone(),
+                                });
+                            }
+                        }
+
+                        if let Some(mut requester_friend_list) =
+                            world.get_mut::<FriendList>(requester_online.entity)
+                        {
+                            if !contains_friend(&requester_friend_list.friends, responder_id) {
+                                requester_friend_list.friends.push(Friend {
+                                    character_id: responder_id,
+                                    name: responder_name.clone(),
+                                });
+                            }
+                        }
+
+                        requester_server_message_tx
+                            .send(ServerMessage::FriendAdded {
+                                friend: FriendInfo {
+                                    character_id: responder_id,
+                                    name: responder_name.clone(),
+                                    status: FriendStatus::Online,
+                                },
+                            })
+                            .ok();
+                        responder_server_message_tx
+                            .send(ServerMessage::FriendAdded {
+                                friend: FriendInfo {
+                                    character_id: requester_id,
+                                    name: requester_name,
+                                    status: FriendStatus::Online,
+                                },
+                            })
+                            .ok();
+                    });
+                }
+                ClientMessage::FriendRemove { friend_id } => {
+                    let sender_entity = game_client.entity;
+                    commands.add(move |world: &mut World| {
+                        let (sender_id, sender_name, removed_friend) = {
+                            let mut query =
+                                world.query::<(&CharacterInfo, &GameClient, &mut FriendList)>();
+                            let Ok((sender_info, sender_game_client, mut sender_friend_list)) =
+                                query.get_mut(world, sender_entity)
+                            else {
+                                return;
+                            };
+
+                            let removed_index = sender_friend_list
+                                .friends
+                                .iter()
+                                .position(|friend| friend.character_id == friend_id);
+                            let Some(removed_index) = removed_index else {
+                                return;
+                            };
+                            let removed_friend = sender_friend_list.friends.remove(removed_index);
+
+                            sender_game_client
+                                .server_message_tx
+                                .send(ServerMessage::FriendRemoved { friend_id })
+                                .ok();
+
+                            (
+                                sender_info.unique_id,
+                                sender_info.name.clone(),
+                                removed_friend,
+                            )
+                        };
+
+                        let target_online = {
+                            let online_friends = world.resource::<OnlineFriends>();
+                            online_friends.get_by_id(friend_id)
+                        };
+
+                        if let Some(target_online) = target_online {
+                            if let Some(mut target_friend_list) =
+                                world.get_mut::<FriendList>(target_online.entity)
+                            {
+                                if let Some(remove_index) = target_friend_list
+                                    .friends
+                                    .iter()
+                                    .position(|friend| friend.character_id == sender_id)
+                                {
+                                    target_friend_list.friends.remove(remove_index);
+                                }
+                            }
+
+                            if let Some(target_game_client) =
+                                world.get::<GameClient>(target_online.entity)
+                            {
+                                target_game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::FriendStatusChanged {
+                                        friend_id: sender_id,
+                                        status: FriendStatus::Deleted,
+                                    })
+                                    .ok();
+                            }
+                        } else if let Ok(mut target_character) =
+                            CharacterStorage::try_load(&removed_friend.name)
+                        {
+                            if let Some(remove_index) = target_character
+                                .friends
+                                .iter()
+                                .position(|friend| friend.character_id == sender_id)
+                            {
+                                target_character.friends.remove(remove_index);
+                                target_character.save().ok();
+                            }
+                        }
+
+                        let _ = sender_name;
+                    });
+                }
+                ClientMessage::FriendChat { friend_id, text } => {
+                    let sender_entity = game_client.entity;
+                    commands.add(move |world: &mut World| {
+                        if text.is_empty() {
+                            return;
+                        }
+
+                        let (sender_id, sender_name, sender_has_friend) = {
+                            let mut sender_query = world.query::<(&CharacterInfo, &FriendList)>();
+                            let Ok((sender_info, sender_friend_list)) =
+                                sender_query.get(world, sender_entity)
+                            else {
+                                return;
+                            };
+
+                            (
+                                sender_info.unique_id,
+                                sender_info.name.clone(),
+                                contains_friend(&sender_friend_list.friends, friend_id),
+                            )
+                        };
+
+                        if !sender_has_friend {
+                            return;
+                        }
+
+                        let target_online = {
+                            let online_friends = world.resource::<OnlineFriends>();
+                            online_friends.get_by_id(friend_id)
+                        };
+                        let Some(target_online) = target_online else {
+                            return;
+                        };
+
+                        let mut target_query = world.query::<(&FriendList, &GameClient)>();
+                        let Ok((target_friend_list, target_game_client)) =
+                            target_query.get(world, target_online.entity)
+                        else {
+                            return;
+                        };
+
+                        if !contains_friend(&target_friend_list.friends, sender_id) {
+                            return;
+                        }
+
+                        target_game_client
+                            .server_message_tx
+                            .send(ServerMessage::FriendChat {
+                                friend_id: sender_id,
+                                from_name: sender_name,
+                                text,
+                            })
+                            .ok();
+                    });
                 }
                 ClientMessage::Move {
                     target_entity_id,
@@ -1159,6 +1791,790 @@ pub fn game_server_main_system(
                         }
                     }
                 }
+                ClientMessage::CraftCreateItem {
+                    skill_slot,
+                    target_item_type,
+                    target_item_number,
+                    material_inventory_slots,
+                } => {
+                    // Validate the skill
+                    let skill_id = game_client.skill_list.get_skill(skill_slot);
+                    let skill_data = skill_id.and_then(|id| game_data.skills.get_skill(id));
+
+                    if skill_data.is_none() {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidCondition,
+                            })
+                            .ok();
+                        continue;
+                    }
+                    let skill_data = skill_data.unwrap();
+
+                    // Get target item data
+                    let target_item_ref = ItemReference::new(target_item_type, target_item_number);
+                    let target_item_data = game_data.items.get_base_item(target_item_ref);
+
+                    if target_item_data.is_none() {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidItem,
+                            })
+                            .ok();
+                        continue;
+                    }
+                    let target_item_data = target_item_data.unwrap();
+
+                    // Check skill's item_make_number matches item's craft_skill_type
+                    if skill_data.item_make_number != target_item_data.craft_skill_type {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidItem,
+                            })
+                            .ok();
+                        continue;
+                    }
+
+                    // Check skill level >= item's craft_skill_level
+                    if skill_data.level < target_item_data.craft_skill_level {
+                        warn!(
+                            "CraftCreateItem NeedSkillLevel: slot {:?}, skill {:?}, current {}, target {:?} #{}, required {}",
+                            skill_slot,
+                            skill_id,
+                            skill_data.level,
+                            target_item_ref.item_type,
+                            target_item_ref.item_number,
+                            target_item_data.craft_skill_level
+                        );
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::NeedSkillLevel,
+                            })
+                            .ok();
+                        continue;
+                    }
+                    let required_mp = manufacture_required_mp(skill_data);
+                    if game_client.mana_points.mp < required_mp {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidCondition,
+                            })
+                            .ok();
+                        continue;
+                    }
+
+                    // Look up the product recipe
+                    let product = game_data
+                        .products
+                        .get_product(target_item_data.craft_material);
+
+                    if product.is_none() {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidItem,
+                            })
+                            .ok();
+                        continue;
+                    }
+                    let product = product.unwrap();
+
+                    // Validate materials exist in inventory
+                    let mut materials_valid = true;
+                    for (i, required_mat) in product.materials.iter().enumerate() {
+                        let requirement =
+                            resolve_craft_material_requirement(&game_data, required_mat.item);
+                        if let Some(inv_item) =
+                            game_client.inventory.get_item(material_inventory_slots[i])
+                        {
+                            let has_enough = match (inv_item, &requirement) {
+                                (
+                                    Item::Stackable(s),
+                                    ResolvedCraftMaterialRequirement::Item(item),
+                                ) => s.item == *item && s.quantity >= required_mat.quantity,
+                                (
+                                    Item::Stackable(s),
+                                    ResolvedCraftMaterialRequirement::ItemClass(required_class),
+                                ) => {
+                                    s.quantity >= required_mat.quantity
+                                        && game_data
+                                            .items
+                                            .get_base_item(s.item)
+                                            .map_or(false, |item_data| {
+                                                item_data.class == *required_class
+                                            })
+                                }
+                                (_, ResolvedCraftMaterialRequirement::Unknown) => {
+                                    warn!(
+                                        "Unresolved craft material requirement for target {:?} #{}: required {:?} #{}",
+                                        target_item_ref.item_type,
+                                        target_item_ref.item_number,
+                                        required_mat.item.item_type,
+                                        required_mat.item.item_number
+                                    );
+                                    false
+                                }
+                                _ => false,
+                            };
+                            if !has_enough {
+                                materials_valid = false;
+                                break;
+                            }
+                        } else {
+                            materials_valid = false;
+                            break;
+                        }
+                    }
+
+                    if !materials_valid {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::NeedItem,
+                            })
+                            .ok();
+                        continue;
+                    }
+
+                    let success_chance = manufacture_success_chance(
+                        skill_data.level,
+                        target_item_data.craft_skill_level,
+                        world_rates.craft_rate,
+                    );
+                    let roll = (rand::random::<u32>() % 100) as i32;
+                    let success = roll < success_chance;
+
+                    let crafted_item = if target_item_type.is_equipment_item() {
+                        let mut equip =
+                            EquipmentItem::new(target_item_ref, target_item_data.durability);
+                        if let Some(ref mut equip) = equip {
+                            equip.is_crafted = true;
+                        }
+                        equip.map(Item::Equipment)
+                    } else {
+                        Some(Item::Stackable(StackableItem {
+                            item: target_item_ref,
+                            quantity: 1,
+                        }))
+                    };
+
+                    let Some(crafted_item) = crafted_item else {
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::InvalidItem,
+                            })
+                            .ok();
+                        continue;
+                    };
+
+                    // Hardening: if this attempt would succeed, pre-validate output insertion
+                    // before consuming materials so a full inventory doesn't burn ingredients.
+                    if success {
+                        let mut inventory_after_success = game_client.inventory.clone();
+                        for (i, required_mat) in product.materials.iter().enumerate() {
+                            inventory_after_success.try_take_quantity(
+                                material_inventory_slots[i],
+                                required_mat.quantity,
+                            );
+                        }
+
+                        if inventory_after_success
+                            .try_add_item(crafted_item.clone())
+                            .is_err()
+                        {
+                            warn!(
+                                "CraftCreateItem blocked: inventory full for target {:?} #{}",
+                                target_item_ref.item_type, target_item_ref.item_number
+                            );
+                            game_client
+                                .game_client
+                                .server_message_tx
+                                .send(ServerMessage::CraftCreateItemError {
+                                    error: CraftCreateItemError::InvalidCondition,
+                                })
+                                .ok();
+                            continue;
+                        }
+                    }
+
+                    // Consume materials
+                    for (i, required_mat) in product.materials.iter().enumerate() {
+                        game_client
+                            .inventory
+                            .try_take_quantity(material_inventory_slots[i], required_mat.quantity);
+                    }
+                    let material_updates = collect_craft_material_inventory_updates(
+                        &game_client.inventory,
+                        &material_inventory_slots,
+                    );
+                    game_client.mana_points.mp = (game_client.mana_points.mp - required_mp).max(0);
+                    let updated_mp = game_client.mana_points.mp;
+
+                    if success {
+                        match game_client.inventory.try_add_item(crafted_item) {
+                            Ok((slot, _)) => {
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::UpdateInventory {
+                                        items: material_updates,
+                                        money: None,
+                                    })
+                                    .ok();
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::UpdateAbilityValueSet {
+                                        ability_type: AbilityType::Mana,
+                                        value: updated_mp,
+                                    })
+                                    .ok();
+
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::CraftCreateItemSuccess {
+                                        inventory_slot: slot,
+                                        item: game_client
+                                            .inventory
+                                            .get_item(slot)
+                                            .cloned()
+                                            .unwrap(),
+                                    })
+                                    .ok();
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "CraftCreateItem add-item failed after precheck for target {:?} #{}",
+                                    target_item_ref.item_type,
+                                    target_item_ref.item_number
+                                );
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::UpdateInventory {
+                                        items: material_updates,
+                                        money: None,
+                                    })
+                                    .ok();
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::UpdateAbilityValueSet {
+                                        ability_type: AbilityType::Mana,
+                                        value: updated_mp,
+                                    })
+                                    .ok();
+                                game_client
+                                    .game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::CraftCreateItemError {
+                                        error: CraftCreateItemError::InvalidCondition,
+                                    })
+                                    .ok();
+                            }
+                        }
+                    } else {
+                        // Crafting failed by RNG - materials are consumed.
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::UpdateInventory {
+                                items: material_updates,
+                                money: None,
+                            })
+                            .ok();
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::UpdateAbilityValueSet {
+                                ability_type: AbilityType::Mana,
+                                value: updated_mp,
+                            })
+                            .ok();
+
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftCreateItemError {
+                                error: CraftCreateItemError::Failed,
+                            })
+                            .ok();
+                    }
+                }
+                ClientMessage::CraftSkillUpgradeItem {
+                    skill_slot,
+                    item_slot,
+                    ingredients,
+                } => {
+                    // Validate skill
+                    let skill_id = game_client.skill_list.get_skill(skill_slot);
+                    let skill_data = skill_id.and_then(|id| game_data.skills.get_skill(id));
+
+                    if skill_data.is_none() {
+                        continue;
+                    }
+                    let skill_data = skill_data.unwrap();
+                    if skill_data.skill_type != SkillType::CreateWindow
+                        || skill_data.item_make_number != 42
+                    {
+                        warn!(
+                            "CraftSkillUpgradeItem invalid skill for upgrade: {:?} make_number {}",
+                            skill_data.skill_type, skill_data.item_make_number
+                        );
+                        continue;
+                    }
+                    let required_mp = manufacture_required_mp(skill_data);
+
+                    // Get the target equipment item
+                    let target_item = game_client.inventory.get_item(item_slot).cloned();
+                    let target_equip = match &target_item {
+                        Some(Item::Equipment(equip)) => Some(equip.clone()),
+                        _ => None,
+                    };
+
+                    if target_equip.is_none() {
+                        continue;
+                    }
+                    let target_equip = target_equip.unwrap();
+
+                    if target_equip.grade >= 9 {
+                        continue;
+                    }
+
+                    let required_quantities = match validate_upgrade_materials(
+                        &game_data,
+                        &game_client.inventory,
+                        target_equip.item,
+                        target_equip.grade,
+                        &ingredients,
+                    ) {
+                        Ok(required_quantities) => required_quantities,
+                        Err(reason) => {
+                            warn!(
+                                "CraftSkillUpgradeItem invalid materials for target {:?} #{} grade {}: {}",
+                                target_equip.item.item_type,
+                                target_equip.item.item_number,
+                                target_equip.grade,
+                                reason
+                            );
+                            continue;
+                        }
+                    };
+
+                    if game_client.mana_points.mp < required_mp {
+                        warn!(
+                            "CraftSkillUpgradeItem insufficient MP: have {}, need {}",
+                            game_client.mana_points.mp, required_mp
+                        );
+                        continue;
+                    }
+
+                    // Consume exact required ingredient quantities
+                    for (ingredient_slot, required_quantity) in
+                        ingredients.iter().zip(required_quantities.iter())
+                    {
+                        if *required_quantity == 0 {
+                            continue;
+                        }
+                        game_client
+                            .inventory
+                            .try_take_quantity(*ingredient_slot, *required_quantity);
+                    }
+                    let material_updates = collect_craft_material_inventory_updates(
+                        &game_client.inventory,
+                        &ingredients,
+                    );
+
+                    game_client.mana_points.mp = (game_client.mana_points.mp - required_mp).max(0);
+                    let updated_mp = game_client.mana_points.mp;
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::UpdateAbilityValueSet {
+                            ability_type: AbilityType::Mana,
+                            value: updated_mp,
+                        })
+                        .ok();
+
+                    // Simplified upgrade formula: 90 - grade*8 success rate
+                    let success_chance = (90i32 - target_equip.grade as i32 * 8).clamp(10, 95);
+                    let roll = rand::random::<i32>().unsigned_abs() as i32 % 100;
+                    let success = roll < success_chance;
+
+                    if success {
+                        // Upgrade: increase grade
+                        if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                            if let Some(Item::Equipment(ref mut equip)) = slot_ref {
+                                equip.grade += 1;
+                            }
+                        }
+                        let mut update_items = Vec::new();
+                        update_items.push((
+                            item_slot,
+                            game_client.inventory.get_item(item_slot).cloned(),
+                        ));
+                        update_items.extend(material_updates.iter().cloned());
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftUpgradeSuccess { update_items })
+                            .ok();
+                    } else {
+                        // Failed: decrease grade by 1 (min 0)
+                        if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                            if let Some(Item::Equipment(ref mut equip)) = slot_ref {
+                                equip.grade = equip.grade.saturating_sub(1);
+                            }
+                        }
+                        let mut update_items = Vec::new();
+                        update_items.push((
+                            item_slot,
+                            game_client.inventory.get_item(item_slot).cloned(),
+                        ));
+                        update_items.extend(material_updates.iter().cloned());
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftUpgradeFailed { update_items })
+                            .ok();
+                    }
+                }
+                ClientMessage::CraftNpcUpgradeItem {
+                    npc_entity_id,
+                    item_slot,
+                    ingredients,
+                } => {
+                    if !client_entity_list
+                        .get_zone(game_client.position.zone_id)
+                        .and_then(|zone| zone.get_entity(npc_entity_id))
+                        .map(|(_, _, npc_position)| npc_position.xy())
+                        .map_or(false, |npc_position| {
+                            game_client.position.position.xy().distance(npc_position) <= 6000.0
+                        })
+                    {
+                        continue;
+                    }
+
+                    let target_item = game_client.inventory.get_item(item_slot).cloned();
+                    let target_equip = match &target_item {
+                        Some(Item::Equipment(equip)) => Some(equip.clone()),
+                        _ => None,
+                    };
+
+                    if target_equip.is_none() {
+                        continue;
+                    }
+                    let target_equip = target_equip.unwrap();
+
+                    if target_equip.grade >= 9 {
+                        continue;
+                    }
+
+                    let target_item_data = match game_data.items.get_base_item(target_equip.item) {
+                        Some(target_item_data) => target_item_data,
+                        None => continue,
+                    };
+                    let required_money =
+                        upgrade_from_npc_price(target_item_data.quality, target_equip.grade);
+
+                    let required_quantities = match validate_upgrade_materials(
+                        &game_data,
+                        &game_client.inventory,
+                        target_equip.item,
+                        target_equip.grade,
+                        &ingredients,
+                    ) {
+                        Ok(required_quantities) => required_quantities,
+                        Err(reason) => {
+                            warn!(
+                                "CraftNpcUpgradeItem invalid materials for target {:?} #{} grade {}: {}",
+                                target_equip.item.item_type,
+                                target_equip.item.item_number,
+                                target_equip.grade,
+                                reason
+                            );
+                            continue;
+                        }
+                    };
+
+                    if game_client
+                        .inventory
+                        .try_take_money(required_money)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    // Consume exact required ingredient quantities
+                    for (ingredient_slot, required_quantity) in
+                        ingredients.iter().zip(required_quantities.iter())
+                    {
+                        if *required_quantity == 0 {
+                            continue;
+                        }
+                        game_client
+                            .inventory
+                            .try_take_quantity(*ingredient_slot, *required_quantity);
+                    }
+                    let material_updates = collect_craft_material_inventory_updates(
+                        &game_client.inventory,
+                        &ingredients,
+                    );
+
+                    let success_chance = (90i32 - target_equip.grade as i32 * 8).clamp(10, 95);
+                    let roll = rand::random::<i32>().unsigned_abs() as i32 % 100;
+                    let success = roll < success_chance;
+
+                    if success {
+                        if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                            if let Some(Item::Equipment(ref mut equip)) = slot_ref {
+                                equip.grade += 1;
+                            }
+                        }
+                        let mut update_items = Vec::new();
+                        update_items.push((
+                            item_slot,
+                            game_client.inventory.get_item(item_slot).cloned(),
+                        ));
+                        update_items.extend(material_updates.iter().cloned());
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftUpgradeSuccess { update_items })
+                            .ok();
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::UpdateMoney {
+                                money: game_client.inventory.money,
+                            })
+                            .ok();
+                    } else {
+                        if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                            if let Some(Item::Equipment(ref mut equip)) = slot_ref {
+                                equip.grade = equip.grade.saturating_sub(1);
+                            }
+                        }
+                        let mut update_items = Vec::new();
+                        update_items.push((
+                            item_slot,
+                            game_client.inventory.get_item(item_slot).cloned(),
+                        ));
+                        update_items.extend(material_updates.iter().cloned());
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::CraftUpgradeFailed { update_items })
+                            .ok();
+                        game_client
+                            .game_client
+                            .server_message_tx
+                            .send(ServerMessage::UpdateMoney {
+                                money: game_client.inventory.money,
+                            })
+                            .ok();
+                    }
+                }
+                ClientMessage::CraftSkillDisassemble {
+                    skill_slot,
+                    item_slot,
+                } => {
+                    // Validate skill
+                    let skill_id = game_client.skill_list.get_skill(skill_slot);
+                    let skill_data = skill_id.and_then(|id| game_data.skills.get_skill(id));
+
+                    let Some(skill_data) = skill_data else {
+                        continue;
+                    };
+
+                    if skill_data.skill_type != SkillType::CreateWindow
+                        || skill_data.item_make_number != 41
+                    {
+                        warn!(
+                            "CraftSkillDisassemble invalid skill for disassembly: {:?} make_number {}",
+                            skill_data.skill_type, skill_data.item_make_number
+                        );
+                        continue;
+                    }
+
+                    let required_mp = manufacture_required_mp(skill_data);
+                    if game_client.mana_points.mp < required_mp {
+                        warn!(
+                            "CraftSkillDisassemble insufficient MP: have {}, need {}",
+                            game_client.mana_points.mp, required_mp
+                        );
+                        continue;
+                    }
+
+                    // Get the target item
+                    let target_item = game_client.inventory.get_item(item_slot).cloned();
+                    let target_item_ref = target_item.as_ref().map(|i| match i {
+                        Item::Equipment(e) => e.item,
+                        Item::Stackable(s) => s.item,
+                    });
+
+                    if target_item_ref.is_none() {
+                        continue;
+                    }
+                    let target_item_ref = target_item_ref.unwrap();
+
+                    // Look up the item's product recipe
+                    let target_item_data = game_data.items.get_base_item(target_item_ref);
+                    if target_item_data.is_none() {
+                        continue;
+                    }
+                    let target_item_data = target_item_data.unwrap();
+
+                    let product = game_data
+                        .products
+                        .get_product(target_item_data.craft_material);
+                    if product.is_none() {
+                        continue;
+                    }
+                    let product = product.unwrap();
+
+                    // Remove the item being disassembled
+                    if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                        *slot_ref = None;
+                    }
+
+                    let mut update_items: Vec<(ItemSlot, Option<Item>)> = Vec::new();
+                    update_items.push((item_slot, None)); // item was removed
+
+                    // Return 50-75% of required materials
+                    for mat in &product.materials {
+                        let return_pct = 50 + (rand::random::<u32>() % 26); // 50-75%
+                        let return_qty =
+                            ((mat.quantity as u64 * return_pct as u64) / 100).max(1) as u32;
+
+                        let returned_item = Item::Stackable(StackableItem {
+                            item: mat.item,
+                            quantity: return_qty,
+                        });
+
+                        if let Ok((slot, _)) = game_client.inventory.try_add_item(returned_item) {
+                            update_items
+                                .push((slot, game_client.inventory.get_item(slot).cloned()));
+                        }
+                    }
+
+                    game_client.mana_points.mp = (game_client.mana_points.mp - required_mp).max(0);
+                    let updated_mp = game_client.mana_points.mp;
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::UpdateAbilityValueSet {
+                            ability_type: AbilityType::Mana,
+                            value: updated_mp,
+                        })
+                        .ok();
+
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::CraftDisassembleSuccess { update_items })
+                        .ok();
+                }
+                ClientMessage::CraftNpcDisassemble {
+                    npc_entity_id,
+                    item_slot,
+                } => {
+                    if !client_entity_list
+                        .get_zone(game_client.position.zone_id)
+                        .and_then(|zone| zone.get_entity(npc_entity_id))
+                        .map(|(_, _, npc_position)| npc_position.xy())
+                        .map_or(false, |npc_position| {
+                            game_client.position.position.xy().distance(npc_position) <= 6000.0
+                        })
+                    {
+                        continue;
+                    }
+
+                    // Get the target item
+                    let target_item = game_client.inventory.get_item(item_slot).cloned();
+                    let target_item_ref = target_item.as_ref().map(|i| match i {
+                        Item::Equipment(e) => e.item,
+                        Item::Stackable(s) => s.item,
+                    });
+
+                    if target_item_ref.is_none() {
+                        continue;
+                    }
+                    let target_item_ref = target_item_ref.unwrap();
+
+                    // Look up the item's product recipe
+                    let target_item_data = game_data.items.get_base_item(target_item_ref);
+                    if target_item_data.is_none() {
+                        continue;
+                    }
+                    let target_item_data = target_item_data.unwrap();
+
+                    let cost = disassemble_from_npc_price(target_item_data.quality);
+                    if game_client.inventory.try_take_money(cost).is_err() {
+                        continue;
+                    }
+
+                    let product = game_data
+                        .products
+                        .get_product(target_item_data.craft_material);
+                    if product.is_none() {
+                        continue;
+                    }
+                    let product = product.unwrap();
+
+                    // Remove the item being disassembled
+                    if let Some(slot_ref) = game_client.inventory.get_item_slot_mut(item_slot) {
+                        *slot_ref = None;
+                    }
+
+                    let mut update_items: Vec<(ItemSlot, Option<Item>)> = Vec::new();
+                    update_items.push((item_slot, None)); // item was removed
+
+                    // Return 50-75% of required materials
+                    for mat in &product.materials {
+                        let return_pct = 50 + (rand::random::<u32>() % 26); // 50-75%
+                        let return_qty =
+                            ((mat.quantity as u64 * return_pct as u64) / 100).max(1) as u32;
+
+                        let returned_item = Item::Stackable(StackableItem {
+                            item: mat.item,
+                            quantity: return_qty,
+                        });
+
+                        if let Ok((slot, _)) = game_client.inventory.try_add_item(returned_item) {
+                            update_items
+                                .push((slot, game_client.inventory.get_item(slot).cloned()));
+                        }
+                    }
+
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::CraftDisassembleSuccess { update_items })
+                        .ok();
+                    game_client
+                        .game_client
+                        .server_message_tx
+                        .send(ServerMessage::UpdateMoney {
+                            money: game_client.inventory.money,
+                        })
+                        .ok();
+                }
                 ClientMessage::BankOpen => {
                     events.bank_events.send(BankEvent::Open {
                         entity: game_client.entity,
@@ -1283,6 +2699,12 @@ pub fn game_server_main_system(
                     events.clan_events.send(ClanEvent::Demote {
                         changer_entity: game_client.entity,
                         name,
+                    });
+                }
+                ClientMessage::ClanUpgrade { npc_entity_id } => {
+                    events.clan_events.send(ClanEvent::Upgrade {
+                        requester_entity: game_client.entity,
+                        npc_entity_id,
                     });
                 }
                 ClientMessage::ClanLeave => {

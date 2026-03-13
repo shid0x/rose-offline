@@ -2,6 +2,7 @@ use bevy::prelude::{Entity, Event};
 
 use rose_data::SkillId;
 use rose_game_common::components::{ClanLevel, ClanMark, ClanPoints, Money};
+use rose_game_common::messages::ClientEntityId;
 
 use crate::game::components::Level;
 
@@ -37,6 +38,10 @@ pub enum ClanEvent {
     Demote {
         changer_entity: Entity,
         name: String,
+    },
+    Upgrade {
+        requester_entity: Entity,
+        npc_entity_id: ClientEntityId,
     },
     Leave {
         leaver_entity: Entity,

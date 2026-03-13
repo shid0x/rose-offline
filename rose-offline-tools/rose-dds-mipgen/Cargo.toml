@@ -1,0 +1,17 @@
+[package]
+name = "rose-dds-mipgen"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+rose-file-readers = { path = "../../rose-file-readers" }
+clap = { workspace = true }
+log = { workspace = true }
+simplelog = { workspace = true }
+ddsfile = "0.5"
+image = { version = "0.24", default-features = false }
+texpresso = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = "0.7"
