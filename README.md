@@ -37,6 +37,8 @@ Note: This list should be compared with rose-offline, as this project expands on
 - 2047 damage limit removed
 - `/mon ID vs ID` (useless but fun)
 - Anti-aliasing and anti-shimmering measures (to use these, you can either use the pre-generated client provided in the release or run the mipgen tool and generate the mipmaps yourself — see below)
+- Added a tooltip window that appears when hovering over character statistics
+
 
 **Bug fixes (bugs in rose-offline that have been corrected)**
 
@@ -58,6 +60,9 @@ Note: This list should be compared with rose-offline, as this project expands on
 - Refining and disassembly at NPCs are now possible with the correct formula (money instead of MP)
 - Corrected the clan house teleport point (the original QSD had out-of-bounds coordinates)
 - Poison is now visible in both PVE and PVP
+- Prevents characters from equipping an off-hand item while a two-handed weapon is already equipped. Credits : [@Yentis](https://www.github.com/Yentis
+- Resolved an issue where summoned entities could incorrectly take ownership of items. Credit : [@Yentis](https://www.github.com/Yentis
+- Improved tooltip text Credits : [@Yentis](https://www.github.com/Yentis)
 
 ## How to use the mipmaps tool
 
