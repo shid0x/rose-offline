@@ -60,8 +60,8 @@ Note: This list should be compared with rose-offline, as this project expands on
 - Refining and disassembly at NPCs are now possible with the correct formula (money instead of MP)
 - Corrected the clan house teleport point (the original QSD had out-of-bounds coordinates)
 - Poison is now visible in both PVE and PVP
-- Prevents characters from equipping an off-hand item while a two-handed weapon is already equipped. Credits : [@Yentis](https://www.github.com/Yentis
-- Resolved an issue where summoned entities could incorrectly take ownership of items. Credit : [@Yentis](https://www.github.com/Yentis
+- Prevents characters from equipping an off-hand item while a two-handed weapon is already equipped. Credits : [@Yentis](https://www.github.com/Yentis)
+- Resolved an issue where summoned entities could incorrectly take ownership of items. Credit : [@Yentis](https://www.github.com/Yentis)
 - Improved tooltip text Credits : [@Yentis](https://www.github.com/Yentis)
 - Additional damage no longer reduces actual damage. Credits : [@Yentis](https://www.github.com/Yentis) 
 - Monster nametag cache now includes monster name and local player level
