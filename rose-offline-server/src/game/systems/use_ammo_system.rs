@@ -28,18 +28,16 @@ pub fn use_ammo_system(
         if let Some(game_client) = game_client {
             match equipment.get_ammo_item(event.ammo_index) {
                 Some(ammo_item) => {
-                    if (ammo_item.quantity & 0x0F) == 0 {
-                        game_client
-                            .server_message_tx
-                            .send(ServerMessage::UpdateInventory {
-                                items: vec![(
-                                    ItemSlot::Ammo(event.ammo_index),
-                                    Some(Item::Stackable(ammo_item.clone())),
-                                )],
-                                money: None,
-                            })
-                            .ok();
-                    }
+                    game_client
+                        .server_message_tx
+                        .send(ServerMessage::UpdateInventory {
+                            items: vec![(
+                                ItemSlot::Ammo(event.ammo_index),
+                                Some(Item::Stackable(ammo_item.clone())),
+                            )],
+                            money: None,
+                        })
+                        .ok();
                 }
                 None => {
                     server_messages.send_entity_message(

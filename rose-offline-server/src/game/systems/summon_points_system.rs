@@ -1,17 +1,25 @@
 use bevy::{
-    ecs::prelude::{Added, Changed, Commands, Entity, Or, Query, ResMut, With},
-    math::Vec3Swizzles,
+    ecs::prelude::{Added, Changed, Commands, Entity, Or, Query, ResMut, With, Without},
+    math::{Vec3, Vec3Swizzles},
 };
 
 use crate::game::{
     bundles::client_entity_leave_zone,
     components::{
-        AbilityValues, BonfireAura, ClientEntity, ClientEntitySector, Command, Dead, GameClient,
-        Owner, Position, SpawnOrigin, SummonPointCost, SummonUsage, BONFIRE_OWNER_LEASH_DISTANCE,
+        AbilityValues, BonfireAura, ClientEntity, ClientEntitySector, Command, CommandData, Dead,
+        GameClient, MoveMode, MoveSpeed, NextCommand, Owner, Position, SpawnOrigin,
+        SummonPointCost, SummonUsage, BONFIRE_OWNER_LEASH_DISTANCE,
     },
     messages::server::ServerMessage,
     resources::ClientEntityList,
 };
+
+/// If a summon is farther than this from its owner, it will actively follow.
+const SUMMON_FOLLOW_DISTANCE: f32 = 150.0;
+/// If a summon is farther than this from its owner, teleport it instantly.
+const SUMMON_TELEPORT_DISTANCE: f32 = 1500.0;
+/// Speed multiplier so summons catch up to the owner.
+const SUMMON_FOLLOW_SPEED_MULTIPLIER: f32 = 1.2;
 
 fn send_summon_points_update(
     game_client: &GameClient,
@@ -173,5 +181,102 @@ pub fn summon_points_owner_reset_system(
         if owner_dead.is_some() || owner_client_entity.is_none() {
             summon_usage.used_points = 0;
         }
+    }
+}
+
+/// Proactively makes summons follow their owner every tick.
+/// - Within SUMMON_FOLLOW_DISTANCE: do nothing
+/// - Beyond SUMMON_TELEPORT_DISTANCE: teleport instantly
+/// - Otherwise: issue a run command toward the owner and boost speed to keep up
+pub fn summon_follow_teleport_system(
+    mut commands: Commands,
+    query_owner: Query<(&Position, &MoveSpeed), Without<Owner>>,
+    mut query_summons: Query<
+        (
+            Entity,
+            &Owner,
+            &SpawnOrigin,
+            &mut Position,
+            &Command,
+            &AbilityValues,
+        ),
+        Without<Dead>,
+    >,
+) {
+    for (
+        summon_entity,
+        owner,
+        spawn_origin,
+        mut summon_position,
+        summon_command,
+        summon_ability_values,
+    ) in query_summons.iter_mut()
+    {
+        if !matches!(spawn_origin, SpawnOrigin::Summoned(_, _)) {
+            continue;
+        }
+
+        let (owner_position, owner_move_speed) = match query_owner.get(owner.entity) {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+
+        // Only act within the same zone
+        if owner_position.zone_id != summon_position.zone_id {
+            continue;
+        }
+
+        let delta = owner_position.position.xy() - summon_position.position.xy();
+        let distance_sq = delta.length_squared();
+
+        // Teleport if way too far
+        if distance_sq > SUMMON_TELEPORT_DISTANCE * SUMMON_TELEPORT_DISTANCE {
+            let direction = if distance_sq > 0.0 {
+                delta.normalize()
+            } else {
+                bevy::math::Vec2::X
+            };
+            let new_pos = owner_position.position.xy() - direction * SUMMON_FOLLOW_DISTANCE;
+            summon_position.position = Vec3::new(new_pos.x, new_pos.y, 0.0);
+            commands.entity(summon_entity).insert((
+                Command::with_stop(),
+                NextCommand::with_stop(true),
+            ));
+            continue;
+        }
+
+        // Close enough — don't follow
+        if distance_sq <= SUMMON_FOLLOW_DISTANCE * SUMMON_FOLLOW_DISTANCE {
+            continue;
+        }
+
+        // If already moving toward a destination near the owner, don't interrupt
+        if let CommandData::Move { destination, .. } = summon_command.command {
+            let dest_to_owner = owner_position
+                .position
+                .xy()
+                .distance_squared(destination.xy());
+            if dest_to_owner <= SUMMON_FOLLOW_DISTANCE * SUMMON_FOLLOW_DISTANCE {
+                continue;
+            }
+        }
+
+        // Issue a move command toward the owner and boost speed to keep up
+        let direction = delta.normalize();
+        let destination =
+            owner_position.position.xy() - direction * (SUMMON_FOLLOW_DISTANCE * 0.5);
+
+        let summon_run_speed = summon_ability_values.get_run_speed();
+        let follow_speed =
+            (owner_move_speed.speed * SUMMON_FOLLOW_SPEED_MULTIPLIER).max(summon_run_speed);
+
+        commands.entity(summon_entity).insert((
+            NextCommand::with_move(
+                Vec3::new(destination.x, destination.y, 0.0),
+                None,
+                Some(MoveMode::Run),
+            ),
+            MoveSpeed::new(follow_speed),
+        ));
     }
 }

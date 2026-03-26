@@ -81,8 +81,9 @@ pub use startup_clans_system::startup_clans_system;
 pub use startup_zones_system::startup_zones_system;
 pub use status_effect_system::status_effect_system;
 pub use summon_points_system::{
-    summon_points_dead_cleanup_system, summon_points_owner_cleanup_system,
-    summon_points_owner_reset_system, summon_points_sync_system,
+    summon_follow_teleport_system, summon_points_dead_cleanup_system,
+    summon_points_owner_cleanup_system, summon_points_owner_reset_system,
+    summon_points_sync_system,
 };
 pub use update_motion_data_system::{
     update_character_motion_data_system, update_npc_motion_data_system,

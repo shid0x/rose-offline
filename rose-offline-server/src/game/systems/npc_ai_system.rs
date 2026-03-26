@@ -940,31 +940,11 @@ fn ai_action_move_random_distance(
 }
 
 fn ai_action_move_near_owner(
-    ai_system_parameters: &mut AiSystemParameters,
-    ai_parameters: &mut AiParameters,
+    _ai_system_parameters: &mut AiSystemParameters,
+    _ai_parameters: &mut AiParameters,
 ) {
-    if let Some(owner_position) = ai_parameters
-        .source
-        .owner
-        .and_then(|owner| ai_system_parameters.owner_query.get(owner.entity).ok())
-        .map(|(position, _)| position.clone())
-    {
-        // Move 80% of the way towards owner
-        let delta = owner_position.position.xy() - ai_parameters.source.position.position.xy();
-        let distance = 0.8 * delta.length();
-        let direction = delta.normalize();
-        let destination = ai_parameters.source.position.position.xy() + direction * distance;
-
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
-            NextCommand::with_move(
-                Vec3::new(destination.x, destination.y, 0.0),
-                None,
-                Some(MoveMode::Run),
-            ),
-        );
-    }
+    // Follow behavior is now handled by summon_follow_teleport_system every tick.
+    // This AIP action is kept as a no-op so existing AI scripts don't error.
 }
 
 fn ai_action_attack_owner_target(

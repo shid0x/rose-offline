@@ -2044,10 +2044,15 @@ impl TryFrom<&Packet> for PacketServerUpdateAmmo {
         let ammo_index =
             decode_ammo_index(ammo_part.item_type() as usize).ok_or(PacketError::InvalidPacket)?;
 
-        let item = StackableItem::new(
-            ItemReference::material(ammo_part.item_number() as usize),
-            999,
-        );
+        let quantity = reader.read_u32()?;
+        let item = if ammo_part.item_number() != 0 {
+            StackableItem::new(
+                ItemReference::material(ammo_part.item_number() as usize),
+                quantity,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             entity_id,
@@ -2074,6 +2079,13 @@ impl From<&PacketServerUpdateAmmo> for Packet {
         for b in part.into_bytes().iter() {
             writer.write_u8(*b);
         }
+        writer.write_u32(
+            packet
+                .item
+                .as_ref()
+                .map(|item| item.quantity)
+                .unwrap_or(0),
+        );
 
         writer.into()
     }
