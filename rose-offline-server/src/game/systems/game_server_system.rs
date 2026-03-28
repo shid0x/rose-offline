@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use rose_data::{
     AbilityType, EquipmentIndex, EquipmentItem, Item, ItemClass, ItemReference, ItemSlotBehaviour,
-    ItemType, SkillType, StackableItem,
+    ItemType, SkillType, StackableItem, VehiclePartIndex,
 };
 use rose_game_common::{
     components::CharacterUniqueId,
@@ -1495,23 +1495,39 @@ pub fn game_server_main_system(
                 ClientMessage::DriveToggle => {
                     if match *game_client.move_mode {
                         MoveMode::Walk | MoveMode::Run => {
-                            // TODO: Check if we have a valid cart equipped....
+                            // Must have body, engine, and leg parts equipped to drive
+                            let has_body = game_client
+                                .equipment
+                                .get_vehicle_item(VehiclePartIndex::Body)
+                                .is_some();
+                            let has_engine = game_client
+                                .equipment
+                                .get_vehicle_item(VehiclePartIndex::Engine)
+                                .is_some();
+                            let has_leg = game_client
+                                .equipment
+                                .get_vehicle_item(VehiclePartIndex::Leg)
+                                .is_some();
 
-                            // Starting driving decreases vehicle engine life
-                            events.item_life_events.send(
-                                ItemLifeEvent::DecreaseVehicleEngineLife {
-                                    entity: game_client.entity,
-                                    amount: None,
-                                },
-                            );
+                            if !has_body || !has_engine || !has_leg {
+                                false
+                            } else {
+                                // Starting driving decreases vehicle engine life
+                                events.item_life_events.send(
+                                    ItemLifeEvent::DecreaseVehicleEngineLife {
+                                        entity: game_client.entity,
+                                        amount: None,
+                                    },
+                                );
 
-                            // Start driving
-                            *game_client.move_mode = MoveMode::Drive;
-                            commands
-                                .entity(game_client.entity)
-                                .insert(DrivingTime::default());
+                                // Start driving
+                                *game_client.move_mode = MoveMode::Drive;
+                                commands
+                                    .entity(game_client.entity)
+                                    .insert(DrivingTime::default());
 
-                            true
+                                true
+                            }
                         }
                         MoveMode::Drive => {
                             *game_client.move_mode = MoveMode::Run;

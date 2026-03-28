@@ -5,7 +5,7 @@ use bevy::{
 
 use rose_data::{
     BaseItemData, EquipmentIndex, Item, ItemType, JobId, StackError, StackableSlotBehaviour,
-    VehiclePartIndex,
+    VehiclePartIndex, VehicleType,
 };
 use rose_game_common::messages::server::ServerMessage;
 
@@ -239,6 +239,24 @@ pub fn equipment_event_system(
                 };
 
                 if let Some(updated_inventory_items) = updated_inventory_items {
+                    // Broadcast UpdateVehiclePart for each vehicle slot that changed
+                    // (the requested part, plus any auto-unequipped parts on body type change)
+                    for &(slot, _) in &updated_inventory_items {
+                        if let ItemSlot::Vehicle(changed_part_index) = slot {
+                            server_messages.send_entity_message(
+                                entity.client_entity,
+                                ServerMessage::UpdateVehiclePart {
+                                    entity_id: entity.client_entity.id,
+                                    vehicle_part_index: changed_part_index,
+                                    item: entity
+                                        .equipment
+                                        .get_vehicle_item(changed_part_index)
+                                        .cloned(),
+                                },
+                            );
+                        }
+                    }
+
                     if let Some(game_client) = entity.game_client {
                         game_client
                             .server_message_tx
@@ -248,18 +266,6 @@ pub fn equipment_event_system(
                             })
                             .ok();
                     }
-
-                    server_messages.send_entity_message(
-                        entity.client_entity,
-                        ServerMessage::UpdateVehiclePart {
-                            entity_id: entity.client_entity.id,
-                            vehicle_part_index,
-                            item: entity
-                                .equipment
-                                .get_vehicle_item(vehicle_part_index)
-                                .cloned(),
-                        },
-                    );
                 }
             }
         }
@@ -275,6 +281,7 @@ enum EquipItemError {
     CannotUnequipOffhand,
     CannotEquipOffhand,
     InventoryFull,
+    IncompatibleVehicleType,
 }
 
 fn equip_from_inventory(
@@ -380,6 +387,16 @@ fn equip_from_inventory(
     Ok(updated_inventory_items)
 }
 
+fn get_equipped_vehicle_type(
+    game_data: &GameData,
+    equipment: &Equipment,
+) -> Option<VehicleType> {
+    equipment
+        .get_vehicle_item(VehiclePartIndex::Body)
+        .and_then(|item| game_data.items.get_vehicle_item(item.item.item_number))
+        .map(|item_data| item_data.vehicle_type)
+}
+
 fn equip_vehicle_from_inventory(
     game_data: &GameData,
     entity: &mut EquipmentEventEntityItem,
@@ -388,7 +405,6 @@ fn equip_vehicle_from_inventory(
 ) -> Result<Vec<(ItemSlot, Option<Item>)>, EquipItemError> {
     // TODO: Cannot change equipment whilst casting spell
     // TODO: Cannot change equipment whilst stunned
-    // TODO: Do not allow mixing of cart / castle gear parts
 
     let equipment_item = entity
         .inventory
@@ -414,7 +430,50 @@ fn equip_vehicle_from_inventory(
         return Err(EquipItemError::FailedRequirements);
     }
 
+    // Vehicle type compatibility check:
+    // - When equipping a non-body part, it must match the equipped body's vehicle type.
+    // - When equipping a body of a different type, auto-unequip incompatible parts first.
+    let new_vehicle_type = item_data.vehicle_type;
+    let current_body_type = get_equipped_vehicle_type(game_data, &entity.equipment);
+
     let mut updated_inventory_items = Vec::new();
+
+    if vehicle_part_index == VehiclePartIndex::Body {
+        // Equipping a body part: if type differs from existing non-body parts, auto-unequip them
+        let other_parts = [
+            VehiclePartIndex::Engine,
+            VehiclePartIndex::Leg,
+            VehiclePartIndex::Arms,
+        ];
+        for &part in &other_parts {
+            if let Some(existing_part) = entity.equipment.get_vehicle_item(part) {
+                let existing_part_type = game_data
+                    .items
+                    .get_vehicle_item(existing_part.item.item_number)
+                    .map(|d| d.vehicle_type);
+                if existing_part_type != Some(new_vehicle_type) {
+                    match unequip_vehicle_to_inventory(
+                        &mut entity.equipment,
+                        &mut entity.inventory,
+                        part,
+                    ) {
+                        Ok(items) => updated_inventory_items.extend(items),
+                        Err(UnequipError::InventoryFull) => {
+                            return Err(EquipItemError::InventoryFull)
+                        }
+                        Err(UnequipError::NoItem) => {}
+                    }
+                }
+            }
+        }
+    } else {
+        // Equipping a non-body part: must match the body's vehicle type (if body is equipped)
+        if let Some(body_type) = current_body_type {
+            if new_vehicle_type != body_type {
+                return Err(EquipItemError::IncompatibleVehicleType);
+            }
+        }
+    }
 
     // Equip item from inventory
     let inventory_slot = entity.inventory.get_item_slot_mut(item_slot).unwrap();

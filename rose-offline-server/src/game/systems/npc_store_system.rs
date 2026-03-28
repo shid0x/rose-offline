@@ -1,9 +1,8 @@
 use bevy::ecs::prelude::{Entity, EventReader, Mut, Query, Res};
 use bevy::math::Vec3Swizzles;
-use log::warn;
 use std::collections::HashSet;
 
-use rose_data::Item;
+use rose_data::{AbilityType, Item};
 
 use crate::game::{
     components::{
@@ -20,6 +19,27 @@ use crate::game::{
 
 pub const NPC_STORE_TRANSACTION_MAX_DISTANCE: f32 = 6000.0;
 
+struct NpcStoreTransactionResult {
+    updated_inventory_slots: HashSet<ItemSlot>,
+    union_points_update: Option<(AbilityType, i32)>,
+}
+
+fn union_points_ability_type(union_number: usize) -> Option<AbilityType> {
+    match union_number {
+        1 => Some(AbilityType::UnionPoint1),
+        2 => Some(AbilityType::UnionPoint2),
+        3 => Some(AbilityType::UnionPoint3),
+        4 => Some(AbilityType::UnionPoint4),
+        5 => Some(AbilityType::UnionPoint5),
+        6 => Some(AbilityType::UnionPoint6),
+        7 => Some(AbilityType::UnionPoint7),
+        8 => Some(AbilityType::UnionPoint8),
+        9 => Some(AbilityType::UnionPoint9),
+        10 => Some(AbilityType::UnionPoint10),
+        _ => None,
+    }
+}
+
 fn npc_store_do_transaction(
     npc_query: &Query<(&Npc, &Position)>,
     game_data: &GameData,
@@ -30,8 +50,8 @@ fn npc_store_do_transaction(
     ability_values: &AbilityValues,
     inventory: &mut Mut<Inventory>,
     position: &Position,
-    _union_membership: &UnionMembership,
-) -> Result<HashSet<ItemSlot>, NpcStoreTransactionError> {
+    union_membership: &mut Mut<UnionMembership>,
+) -> Result<NpcStoreTransactionResult, NpcStoreTransactionError> {
     let (npc, npc_position) = npc_query
         .get(store_entity)
         .map_err(|_| NpcStoreTransactionError::NpcNotFound)?;
@@ -41,10 +61,11 @@ fn npc_store_do_transaction(
         .get_npc(npc.id)
         .ok_or(NpcStoreTransactionError::NpcNotFound)?;
 
-    if npc_data.store_union_number.is_some() {
-        warn!("Unimplemented union NPC store");
-        // TODO: if npc_data.store_union_number != union_membership.current_union { ... etc
-        return Err(NpcStoreTransactionError::NotSameUnion);
+    let union_store = npc_data.store_union_number;
+    if let Some(required_union) = union_store {
+        if union_membership.current_union != Some(required_union) {
+            return Err(NpcStoreTransactionError::NotSameUnion);
+        }
     }
 
     if npc_position.zone_id != position.zone_id
@@ -57,6 +78,7 @@ fn npc_store_do_transaction(
     let mut total_buy_cost = 0i64;
     let mut total_sell_value = 0i64;
     let mut transaction_inventory = inventory.clone();
+    let mut transaction_union_membership = union_membership.clone();
     let mut updated_inventory_slots = HashSet::new();
 
     // First process sell items
@@ -113,22 +135,26 @@ fn npc_store_do_transaction(
             .get_base_item(store_item_reference)
             .ok_or(NpcStoreTransactionError::NpcNotFound)?;
 
-        let item_price = game_data
-            .ability_value_calculator
-            .calculate_npc_store_item_buy_price(
-                &game_data.items,
-                store_item_reference,
-                ability_values.get_npc_store_buy_rate(),
-                world_rates.item_price_rate,
-                world_rates.town_price_rate,
-            )
-            .ok_or(NpcStoreTransactionError::NpcNotFound)? as i64;
-
         let buy_quantity = if store_item_reference.item_type.is_stackable_item() {
             buy_item.quantity
         } else {
             1
         } as i64;
+
+        let item_price = if union_store.is_some() {
+            i64::from(store_item_data.craft_difficulty)
+        } else {
+            game_data
+                .ability_value_calculator
+                .calculate_npc_store_item_buy_price(
+                    &game_data.items,
+                    store_item_reference,
+                    ability_values.get_npc_store_buy_rate(),
+                    world_rates.item_price_rate,
+                    world_rates.town_price_rate,
+                )
+                .ok_or(NpcStoreTransactionError::NpcNotFound)? as i64
+        };
 
         let item = Item::from_item_data(store_item_data, buy_quantity as u32)
             .ok_or(NpcStoreTransactionError::NpcNotFound)?;
@@ -146,12 +172,36 @@ fn npc_store_do_transaction(
         .try_add_money(Money(total_sell_value))
         .map_err(|_| NpcStoreTransactionError::NotEnoughMoney)?;
 
-    transaction_inventory
-        .try_take_money(Money(total_buy_cost))
-        .map_err(|_| NpcStoreTransactionError::NotEnoughMoney)?;
+    let union_points_update = if let Some(required_union) = union_store {
+        let union_index = required_union.get() - 1;
+        let current_points = transaction_union_membership.points[union_index] as i64;
+        if current_points < total_buy_cost {
+            return Err(NpcStoreTransactionError::NotEnoughUnionPoints);
+        }
+
+        transaction_union_membership.points[union_index] -= total_buy_cost as u32;
+        if total_buy_cost > 0 {
+            Some((
+                union_points_ability_type(required_union.get())
+                    .ok_or(NpcStoreTransactionError::NpcNotFound)?,
+                transaction_union_membership.points[union_index] as i32,
+            ))
+        } else {
+            None
+        }
+    } else {
+        transaction_inventory
+            .try_take_money(Money(total_buy_cost))
+            .map_err(|_| NpcStoreTransactionError::NotEnoughMoney)?;
+        None
+    };
 
     **inventory = transaction_inventory;
-    Ok(updated_inventory_slots)
+    **union_membership = transaction_union_membership;
+    Ok(NpcStoreTransactionResult {
+        updated_inventory_slots,
+        union_points_update,
+    })
 }
 
 pub fn npc_store_system(
@@ -160,15 +210,15 @@ pub fn npc_store_system(
         &AbilityValues,
         &mut Inventory,
         &Position,
-        &UnionMembership,
+        &mut UnionMembership,
         Option<&GameClient>,
     )>,
     mut npc_store_events: EventReader<NpcStoreEvent>,
-    game_data: Res<GameData>,
-    world_rates: Res<WorldRates>,
+        game_data: Res<GameData>,
+        world_rates: Res<WorldRates>,
 ) {
     for event in npc_store_events.iter() {
-        if let Ok((ability_values, mut inventory, position, union_membership, game_client)) =
+        if let Ok((ability_values, mut inventory, position, mut union_membership, game_client)) =
             transaction_entity_query.get_mut(event.transaction_entity)
         {
             match npc_store_do_transaction(
@@ -181,20 +231,28 @@ pub fn npc_store_system(
                 ability_values,
                 &mut inventory,
                 position,
-                union_membership,
+                &mut union_membership,
             ) {
-                Ok(updated_items) => {
+                Ok(transaction_result) => {
                     if let Some(game_client) = game_client {
                         game_client
                             .server_message_tx
                             .send(ServerMessage::UpdateInventory {
-                                items: updated_items
+                                items: transaction_result
+                                    .updated_inventory_slots
                                     .iter()
                                     .map(|slot| (*slot, inventory.get_item(*slot).cloned()))
                                     .collect(),
                                 money: Some(inventory.money),
                             })
                             .ok();
+
+                        if let Some((ability_type, value)) = transaction_result.union_points_update {
+                            game_client
+                                .server_message_tx
+                                .send(ServerMessage::UpdateAbilityValueSet { ability_type, value })
+                                .ok();
+                        }
                     }
                 }
                 Err(error) => {
