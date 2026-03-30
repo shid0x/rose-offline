@@ -387,10 +387,7 @@ fn equip_from_inventory(
     Ok(updated_inventory_items)
 }
 
-fn get_equipped_vehicle_type(
-    game_data: &GameData,
-    equipment: &Equipment,
-) -> Option<VehicleType> {
+fn get_equipped_vehicle_type(game_data: &GameData, equipment: &Equipment) -> Option<VehicleType> {
     equipment
         .get_vehicle_item(VehiclePartIndex::Body)
         .and_then(|item| game_data.items.get_vehicle_item(item.item.item_number))

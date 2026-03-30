@@ -1,6 +1,6 @@
 use crate::{reader::RoseFileReader, types::Vec3, RoseFile, VfsPathBuf};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EftParticle {
     pub particle_file: VfsPathBuf,
 
@@ -14,7 +14,7 @@ pub struct EftParticle {
     pub is_linked: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EftMesh {
     pub mesh_file: VfsPathBuf,
     pub mesh_animation_file: Option<VfsPathBuf>,
@@ -40,7 +40,7 @@ pub struct EftMesh {
     pub is_linked: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EftFile {
     pub sound_file: Option<VfsPathBuf>,
     pub sound_repeat_count: u32,

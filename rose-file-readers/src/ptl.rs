@@ -4,7 +4,7 @@ use anyhow::bail;
 
 use crate::{reader::RoseFileReader, RoseFile, VfsPathBuf};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PtlKeyframeData {
     SizeXY(RangeInclusive<f32>, RangeInclusive<f32>),
     Timer(RangeInclusive<f32>),
@@ -30,7 +30,7 @@ pub enum PtlKeyframeData {
     Rotation(RangeInclusive<f32>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PtlKeyframe {
     pub start_time: RangeInclusive<f32>,
     pub fade: bool,
@@ -44,7 +44,7 @@ pub enum PtlUpdateCoords {
     Local,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PtlSequence {
     pub name: String,
     pub life: RangeInclusive<f32>,
@@ -68,7 +68,7 @@ pub struct PtlSequence {
     pub keyframes: Vec<PtlKeyframe>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PtlFile {
     pub sequences: Vec<PtlSequence>,
 }

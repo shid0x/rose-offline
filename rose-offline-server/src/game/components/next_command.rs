@@ -12,6 +12,18 @@ pub struct NextCommand {
 }
 
 impl NextCommand {
+    pub fn target_entity(&self) -> Option<Entity> {
+        match self.command {
+            Some(CommandData::Attack { target, .. }) => Some(target),
+            Some(CommandData::Move { target, .. }) => target,
+            Some(CommandData::CastSkill {
+                skill_target: Some(CommandCastSkillTarget::Entity(entity)),
+                ..
+            }) => Some(entity),
+            _ => None,
+        }
+    }
+
     pub fn with_command_skip_server_message(command: CommandData) -> Self {
         Self {
             command: Some(command),

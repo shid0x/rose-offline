@@ -238,10 +238,9 @@ pub fn summon_follow_teleport_system(
             };
             let new_pos = owner_position.position.xy() - direction * SUMMON_FOLLOW_DISTANCE;
             summon_position.position = Vec3::new(new_pos.x, new_pos.y, 0.0);
-            commands.entity(summon_entity).insert((
-                Command::with_stop(),
-                NextCommand::with_stop(true),
-            ));
+            commands
+                .entity(summon_entity)
+                .insert((Command::with_stop(), NextCommand::with_stop(true)));
             continue;
         }
 
@@ -263,8 +262,7 @@ pub fn summon_follow_teleport_system(
 
         // Issue a move command toward the owner and boost speed to keep up
         let direction = delta.normalize();
-        let destination =
-            owner_position.position.xy() - direction * (SUMMON_FOLLOW_DISTANCE * 0.5);
+        let destination = owner_position.position.xy() - direction * (SUMMON_FOLLOW_DISTANCE * 0.5);
 
         let summon_run_speed = summon_ability_values.get_run_speed();
         let follow_speed =

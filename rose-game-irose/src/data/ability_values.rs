@@ -2324,3 +2324,76 @@ fn calculate_max_weight(
 
     max_weight
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::{Arc, OnceLock},
+    };
+
+    use rose_data::{AbilityType, SkillDatabase, SkillId};
+    use rose_data_irose::{get_skill_database, get_string_database};
+    use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
+    use rose_game_common::components::{SkillList, SkillPage};
+
+    use super::{
+        calculate_drop_rate, calculate_passive_skill_ability_values, EquipmentAbilityValue,
+        IroseSkillPageType,
+    };
+
+    fn asset_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn load_skill_database() -> &'static Arc<SkillDatabase> {
+        static SKILL_DATABASE: OnceLock<Arc<SkillDatabase>> = OnceLock::new();
+
+        SKILL_DATABASE.get_or_init(|| {
+            let vfs =
+                VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(asset_root()))]);
+            let string_database =
+                get_string_database(&vfs, 0).expect("workspace string database should load");
+            Arc::new(
+                get_skill_database(&vfs, string_database)
+                    .expect("workspace skill database should load"),
+            )
+        })
+    }
+
+    #[test]
+    fn stockpile_skill_adds_expected_passive_drop_rate() {
+        let skill_database = load_skill_database();
+        let stockpile = skill_database
+            .get_skill(SkillId::new(2096).unwrap())
+            .expect("stockpile level 6 should exist in the workspace skill data");
+        let stockpile_add_ability = stockpile.add_ability[0]
+            .as_ref()
+            .expect("stockpile should expose a passive drop ability");
+
+        assert_eq!(
+            stockpile_add_ability.ability_type,
+            AbilityType::PassiveDropRate
+        );
+        assert_eq!(stockpile_add_ability.value, 14);
+        assert_eq!(stockpile_add_ability.rate, 0);
+
+        let mut skill_list = SkillList {
+            pages: vec![SkillPage::new(IroseSkillPageType::Passive as usize, 30)],
+        };
+        skill_list
+            .add_skill(stockpile)
+            .expect("stockpile should fit on the passive skill page");
+
+        let passive_ability_values =
+            calculate_passive_skill_ability_values(skill_database.as_ref(), &skill_list);
+
+        assert_eq!(passive_ability_values.value.drop_rate, 14);
+        assert_eq!(
+            calculate_drop_rate(&EquipmentAbilityValue::default(), &passive_ability_values),
+            14
+        );
+    }
+}

@@ -1,6 +1,7 @@
 use std::{
     f32::consts::PI,
     num::{ParseFloatError, ParseIntError},
+    time::{Duration, Instant},
 };
 
 use bevy::{
@@ -20,11 +21,12 @@ use rand::Rng;
 
 use rose_data::{
     AbilityType, EquipmentIndex, EquipmentItem, Item, ItemReference, ItemType, NpcId, SkillId,
-    StackableItem, ZoneId,
+    StackableItem, StatusEffectData, StatusEffectId, StatusEffectType, ZoneId,
 };
 use rose_game_common::{
     components::{
-        BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem, ExperiencePoints, SkillSlot,
+        ActiveStatusEffect, BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem,
+        ExperiencePoints, SkillSlot,
     },
     data::Damage,
     messages::server::PersonalStoreTransactionStatus,
@@ -93,6 +95,8 @@ pub struct ChatCommandUserQuery<'w> {
     skill_points: &'w mut SkillPoints,
     stamina: &'w mut Stamina,
     stat_points: &'w mut StatPoints,
+    status_effects: &'w mut StatusEffects,
+    status_effects_regen: &'w mut StatusEffectsRegen,
     union_membership: &'w mut UnionMembership,
     clan_membership: &'w ClanMembership,
 }
@@ -103,6 +107,7 @@ lazy_static! {
             .subcommand(clap::Command::new("help"))
             .subcommand(clap::Command::new("where"))
             .subcommand(clap::Command::new("ability_values"))
+            .subcommand(clap::Command::new("poison").arg(Arg::new("seconds")))
             .subcommand(
                 clap::Command::new("damage")
                     .arg(Arg::new("amount").required(true))
@@ -304,6 +309,12 @@ fn send_chat_commands_help(client: &GameClient) {
     }
 }
 
+const DEFAULT_POISON_DURATION_SECONDS: u64 = 30;
+
+fn default_poison_status_effect_id() -> StatusEffectId {
+    StatusEffectId::new(7).unwrap()
+}
+
 pub enum ChatCommandError {
     InvalidCommand,
     InvalidArguments,
@@ -335,6 +346,48 @@ impl From<ParseFloatError> for ChatCommandError {
     fn from(_: ParseFloatError) -> Self {
         Self::InvalidArguments
     }
+}
+
+fn canonical_poison_status_effect(game_data: &GameData) -> Result<&StatusEffectData, ChatCommandError> {
+    let status_effect_id = default_poison_status_effect_id();
+    game_data
+        .status_effects
+        .get_status_effect(status_effect_id)
+        .ok_or_else(|| {
+            ChatCommandError::WithMessage(format!(
+                "Missing canonical poison status effect id {}",
+                status_effect_id.get()
+            ))
+        })
+}
+
+fn apply_poison_status_effect(
+    status_effects: &mut StatusEffects,
+    status_effects_regen: &mut StatusEffectsRegen,
+    status_effect_data: &StatusEffectData,
+    expire_time: Instant,
+) {
+    status_effects.active[StatusEffectType::Poisoned] = Some(ActiveStatusEffect {
+        id: status_effect_data.id,
+        value: status_effect_data.apply_per_second_value,
+    });
+    status_effects.expire_times[StatusEffectType::Poisoned] = Some(expire_time);
+    status_effects_regen.regens[StatusEffectType::Poisoned] = None;
+}
+
+fn send_status_effects_update(
+    client: &GameClient,
+    client_entity: &ClientEntity,
+    status_effects: &StatusEffects,
+) {
+    client
+        .server_message_tx
+        .send(ServerMessage::UpdateStatusEffects {
+            entity_id: client_entity.id,
+            status_effects: status_effects.active.clone(),
+            updated_values: Vec::new(),
+        })
+        .ok();
 }
 
 fn parse_mon_vs_command(args: &[String]) -> Result<Option<(NpcId, NpcId)>, ChatCommandError> {
@@ -666,6 +719,40 @@ fn handle_chat_command(
     {
         ("help", _) => {
             send_chat_commands_help(chat_command_user.game_client);
+        }
+        ("poison", arg_matches) => {
+            let seconds = arg_matches
+                .value_of("seconds")
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(DEFAULT_POISON_DURATION_SECONDS);
+            let status_effect_data = canonical_poison_status_effect(&chat_command_params.game_data)?;
+            let expire_time =
+                chat_command_params.time.last_update().unwrap() + Duration::from_secs(seconds);
+
+            apply_poison_status_effect(
+                &mut chat_command_user.status_effects,
+                &mut chat_command_user.status_effects_regen,
+                status_effect_data,
+                expire_time,
+            );
+            send_status_effects_update(
+                chat_command_user.game_client,
+                chat_command_user.client_entity,
+                &chat_command_user.status_effects,
+            );
+            chat_command_user
+                .game_client
+                .server_message_tx
+                .send(ServerMessage::Whisper {
+                    from: String::from("SERVER"),
+                    text: format!(
+                        "Applied poison id {} for {} seconds",
+                        status_effect_data.id.get(),
+                        seconds
+                    ),
+                })
+                .ok();
         }
         ("where", _) => {
             let sector = chat_command_params
@@ -1774,6 +1861,153 @@ pub fn chat_commands_system(
                     };
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use arrayvec::ArrayVec;
+    use crossbeam_channel::unbounded as crossbeam_unbounded;
+    use rose_data::{
+        StatusEffectClearedByType, StatusEffectData, StatusEffectId, StatusEffectType, ZoneId,
+    };
+    use rose_game_common::{
+        components::{
+            ActiveStatusEffect, ActiveStatusEffectRegen, StatusEffects, StatusEffectsRegen,
+        },
+        messages::{server::ServerMessage, ClientEntityId},
+    };
+    use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
+
+    use super::{
+        apply_poison_status_effect, default_poison_status_effect_id, send_status_effects_update,
+        DEFAULT_POISON_DURATION_SECONDS,
+    };
+    use crate::game::components::{ClientEntity, ClientEntityType, GameClient};
+
+    fn test_status_effect_data(
+        id: u16,
+        status_effect_type: StatusEffectType,
+        apply_per_second_value: i32,
+    ) -> StatusEffectData {
+        StatusEffectData {
+            id: StatusEffectId::new(id).unwrap(),
+            name: "test",
+            description: "test",
+            start_message: "test",
+            end_message: "test",
+            status_effect_type,
+            can_be_reapplied: false,
+            cleared_by_type: StatusEffectClearedByType::ClearBad,
+            apply_status_effects: ArrayVec::new(),
+            apply_per_second_value,
+            effect_file_id: None,
+            icon_id: 0,
+        }
+    }
+
+    fn drain_server_messages(
+        server_message_rx: &mut UnboundedReceiver<ServerMessage>,
+    ) -> Vec<ServerMessage> {
+        let mut messages = Vec::new();
+        loop {
+            match server_message_rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        messages
+    }
+
+    #[test]
+    fn default_poison_command_values_match_canonical_irose_poison() {
+        assert_eq!(default_poison_status_effect_id().get(), 7);
+        assert_eq!(DEFAULT_POISON_DURATION_SECONDS, 30);
+    }
+
+    #[test]
+    fn apply_poison_status_effect_refreshes_poison_and_clears_regen() {
+        let poison = test_status_effect_data(7, StatusEffectType::Poisoned, 9);
+        let mut status_effects = StatusEffects::default();
+        let first_expire_time = Instant::now() + Duration::from_secs(5);
+        let second_expire_time = Instant::now() + Duration::from_secs(30);
+
+        status_effects.active[StatusEffectType::Poisoned] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(8).unwrap(),
+            value: 3,
+        });
+        status_effects.expire_times[StatusEffectType::Poisoned] = Some(first_expire_time);
+
+        let mut status_effects_regen = StatusEffectsRegen::default();
+        status_effects_regen.regens[StatusEffectType::Poisoned] = Some(ActiveStatusEffectRegen {
+            total_value: 20,
+            value_per_second: 2,
+            applied_value: 4,
+            applied_duration: Duration::from_secs(2),
+        });
+
+        apply_poison_status_effect(
+            &mut status_effects,
+            &mut status_effects_regen,
+            &poison,
+            second_expire_time,
+        );
+
+        let active_poison = status_effects.active[StatusEffectType::Poisoned]
+            .as_ref()
+            .expect("poison should be active");
+        assert_eq!(active_poison.id, poison.id);
+        assert_eq!(active_poison.value, poison.apply_per_second_value);
+        assert_eq!(
+            status_effects.expire_times[StatusEffectType::Poisoned],
+            Some(second_expire_time)
+        );
+        assert!(status_effects_regen.regens[StatusEffectType::Poisoned].is_none());
+    }
+
+    #[test]
+    fn send_status_effects_update_emits_packet_with_current_status_map() {
+        let (client_message_tx, client_message_rx) = crossbeam_unbounded();
+        drop(client_message_tx);
+        let (server_message_tx, mut server_message_rx) = unbounded_channel();
+        let client = GameClient::new(client_message_rx, server_message_tx);
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Character,
+            ClientEntityId(42),
+            ZoneId::new(1).unwrap(),
+        );
+        let poison = test_status_effect_data(7, StatusEffectType::Poisoned, 9);
+        let mut status_effects = StatusEffects::default();
+        let mut status_effects_regen = StatusEffectsRegen::default();
+
+        apply_poison_status_effect(
+            &mut status_effects,
+            &mut status_effects_regen,
+            &poison,
+            Instant::now() + Duration::from_secs(DEFAULT_POISON_DURATION_SECONDS),
+        );
+        send_status_effects_update(&client, &client_entity, &status_effects);
+
+        let messages = drain_server_messages(&mut server_message_rx);
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            ServerMessage::UpdateStatusEffects {
+                entity_id,
+                status_effects,
+                updated_values,
+            } => {
+                assert_eq!(*entity_id, client_entity.id);
+                assert!(updated_values.is_empty());
+                let active_poison = status_effects[StatusEffectType::Poisoned]
+                    .as_ref()
+                    .expect("poison should be present in packet");
+                assert_eq!(active_poison.id, poison.id);
+            }
+            other => panic!("expected UpdateStatusEffects, got {:?}", other),
         }
     }
 }

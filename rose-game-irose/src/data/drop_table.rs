@@ -21,10 +21,8 @@ impl DropTableData {
     fn lookup_drop(&self, row: usize, column: usize) -> Option<i32> {
         self.drop_table.get(row * self.columns + column).cloned()
     }
-}
 
-impl DropTable for DropTableData {
-    fn get_drop(
+    fn get_drop_with_rng<R: Rng + ?Sized>(
         &self,
         world_drop_item_rate: i32,
         world_drop_money_rate: i32,
@@ -33,24 +31,22 @@ impl DropTable for DropTableData {
         level_difference: i32,
         character_drop_rate: i32,
         character_charm: i32,
+        rng: &mut R,
     ) -> Option<DroppedItem> {
-        let level_difference = level_difference.max(0);
-        if level_difference > 10 {
-            return None;
-        }
+        let level_difference = resolve_level_difference(level_difference)?;
 
         let npc_data = self.npc_database.get_npc(npc_id);
         let npc_drop_item_rate = npc_data.map_or(0, |n| n.drop_item_rate);
         let npc_drop_money_rate = npc_data.map_or(0, |n| n.drop_money_rate);
         let npc_level = npc_data.map_or(0, |n| n.level);
 
-        let mut rng = rand::thread_rng();
-        let drop_var = ((world_drop_item_rate as f32 + npc_drop_item_rate as f32
-            - rng.gen_range::<i32, _>(1..=100) as f32
-            - (level_difference as f32 + 16.0) * 3.5
-            - 10.0
-            + character_drop_rate as f32)
-            * 0.38) as i32;
+        let drop_var = calculate_drop_var(
+            world_drop_item_rate,
+            npc_drop_item_rate,
+            level_difference,
+            character_drop_rate,
+            rng.gen_range(1..=100),
+        );
 
         if drop_var <= 0 {
             return None;
@@ -184,6 +180,55 @@ impl DropTable for DropTableData {
     }
 }
 
+fn calculate_drop_var(
+    world_drop_item_rate: i32,
+    npc_drop_item_rate: i32,
+    level_difference: i32,
+    character_drop_rate: i32,
+    random_roll: i32,
+) -> i32 {
+    ((world_drop_item_rate as f32 + npc_drop_item_rate as f32
+        - random_roll as f32
+        - (level_difference as f32 + 16.0) * 3.5
+        - 10.0
+        + character_drop_rate as f32)
+        * 0.38) as i32
+}
+
+fn resolve_level_difference(level_difference: i32) -> Option<i32> {
+    let level_difference = level_difference.max(0);
+    if level_difference >= 10 {
+        None
+    } else {
+        Some(level_difference)
+    }
+}
+
+impl DropTable for DropTableData {
+    fn get_drop(
+        &self,
+        world_drop_item_rate: i32,
+        world_drop_money_rate: i32,
+        npc_id: NpcId,
+        zone_id: ZoneId,
+        level_difference: i32,
+        character_drop_rate: i32,
+        character_charm: i32,
+    ) -> Option<DroppedItem> {
+        let mut rng = rand::thread_rng();
+        self.get_drop_with_rng(
+            world_drop_item_rate,
+            world_drop_money_rate,
+            npc_id,
+            zone_id,
+            level_difference,
+            character_drop_rate,
+            character_charm,
+            &mut rng,
+        )
+    }
+}
+
 pub fn get_drop_table(
     vfs: &VirtualFilesystem,
     item_database: Arc<ItemDatabase>,
@@ -208,4 +253,28 @@ pub fn get_drop_table(
         columns,
         drop_table,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_drop_var;
+    use super::resolve_level_difference;
+
+    #[test]
+    fn character_drop_rate_increases_drop_var() {
+        let without_bonus = calculate_drop_var(300, 35, 0, 0, 100);
+        let with_stockpile = calculate_drop_var(300, 35, 0, 14, 100);
+
+        assert_eq!(without_bonus, 64);
+        assert_eq!(with_stockpile, 69);
+        assert!(with_stockpile > without_bonus);
+    }
+
+    #[test]
+    fn level_difference_of_ten_blocks_drops() {
+        assert_eq!(resolve_level_difference(-3), Some(0));
+        assert_eq!(resolve_level_difference(9), Some(9));
+        assert_eq!(resolve_level_difference(10), None);
+        assert_eq!(resolve_level_difference(12), None);
+    }
 }

@@ -214,8 +214,8 @@ pub fn npc_store_system(
         Option<&GameClient>,
     )>,
     mut npc_store_events: EventReader<NpcStoreEvent>,
-        game_data: Res<GameData>,
-        world_rates: Res<WorldRates>,
+    game_data: Res<GameData>,
+    world_rates: Res<WorldRates>,
 ) {
     for event in npc_store_events.iter() {
         if let Ok((ability_values, mut inventory, position, mut union_membership, game_client)) =
@@ -247,10 +247,14 @@ pub fn npc_store_system(
                             })
                             .ok();
 
-                        if let Some((ability_type, value)) = transaction_result.union_points_update {
+                        if let Some((ability_type, value)) = transaction_result.union_points_update
+                        {
                             game_client
                                 .server_message_tx
-                                .send(ServerMessage::UpdateAbilityValueSet { ability_type, value })
+                                .send(ServerMessage::UpdateAbilityValueSet {
+                                    ability_type,
+                                    value,
+                                })
                                 .ok();
                         }
                     }
