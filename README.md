@@ -11,7 +11,7 @@ Some fixes took a noticeable amount of time and required doing your own research
 
 ## Setup and client :
 
-Recommended client for Slop Rose can be found here : [Slop Rose client](https://mega.nz/file/kYk0SIrL#dyt9mN9eHFz-7aol5a2BH7EyhDv_MuKElxQEbazbul8) , This client include pre extracted mips folder
+Recommended client for Slop Rose can be found here : [Slop Rose client](https://mega.nz/file/pUN2RQIZ#PjyP4zZfzGyKRLsPeXee8Ca2S5YyENmcQDz3YTp2ceQ) , This client include pre extracted mips folder
 so you don't need to do it yourself
 
 Edit config.toml with your desired settings  ( you have to point it toward your local data.idx and the mips folder ) , then launch the server and the client.
