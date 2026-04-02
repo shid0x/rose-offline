@@ -30,6 +30,22 @@ const BUILTIN_EXCLUDED_TEXTURES: &[&str] = &[
     "3DDATA/NPC/ANIMAL/BEE/BODY01_010.DDS",
     // Known problematic asset: mip generation introduces black artifacts on the raccoon head.
     "3DDATA/NPC/ANIMAL/RACCOON/HEAD01_010.DDS",
+    // Known problematic asset: mip generation causes black hair artifacts at distance.
+    "3DDATA/AVATAR/HAIR/HAIR01_00600.DDS",
+    // Known problematic asset: mip generation causes black hair artifacts at distance.
+    "3DDATA/AVATAR/HAIR/HAIR01_00610.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_04100.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_04110.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_04120.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_03800.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_03810.DDS",
+    // Known problematic asset: mip generation causes black body armor artifacts at distance.
+    "3DDATA/AVATAR/BODY/BODY1_03700.DDS",
 ];
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]

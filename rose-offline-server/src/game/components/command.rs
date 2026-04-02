@@ -46,6 +46,7 @@ pub enum CommandData {
         use_item: Option<(ItemSlot, Item)>,
         cast_motion_id: Option<MotionId>,
         action_motion_id: Option<MotionId>,
+        restore_command: Option<Box<CommandData>>,
     },
 
     /// Transition to Sit
@@ -224,6 +225,22 @@ impl Command {
         casting_duration: Duration,
         action_duration: Duration,
     ) -> Self {
+        Self::with_cast_skill_restore(
+            skill_id,
+            skill_target,
+            casting_duration,
+            action_duration,
+            None,
+        )
+    }
+
+    pub fn with_cast_skill_restore(
+        skill_id: SkillId,
+        skill_target: Option<CommandCastSkillTarget>,
+        casting_duration: Duration,
+        action_duration: Duration,
+        restore_command: Option<CommandData>,
+    ) -> Self {
         Self::new(
             CommandData::CastSkill {
                 skill_id,
@@ -231,6 +248,7 @@ impl Command {
                 use_item: None,
                 cast_motion_id: None,
                 action_motion_id: None,
+                restore_command: restore_command.map(Box::new),
             },
             Some(casting_duration + action_duration),
         )

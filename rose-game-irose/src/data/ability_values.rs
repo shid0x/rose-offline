@@ -1085,8 +1085,11 @@ fn calculate_damage_success_rate(
     if attacker.get_damage_category() == DamageCategory::Character
         && defender.get_damage_category() == DamageCategory::Character
     {
-        40 - 60 * ((attacker.get_hit() + defender.get_avoid()) / attacker.get_avoid())
-            + rng.gen_range(1..=100)
+        calculate_pvp_damage_success_rate(
+            attacker.get_hit(),
+            defender.get_avoid(),
+            rng.gen_range(0..180),
+        )
     } else {
         let value = (attacker.get_level() + 10) - (defender.get_level() as f32 * 1.1) as i32
             + rng.gen_range(1..=50);
@@ -1101,6 +1104,15 @@ fn calculate_damage_success_rate(
                     / 80.0)) as i32
         }
     }
+}
+
+fn calculate_pvp_damage_success_rate(
+    attacker_hit: i32,
+    defender_avoid: i32,
+    random_0_to_179: i32,
+) -> i32 {
+    ((attacker_hit as f32 - defender_avoid as f32 * 0.7 + 1.0 + random_0_to_179 as f32 + 10.0)
+        * 0.2) as i32
 }
 
 fn calculate_attack_damage_physical(
@@ -2332,14 +2344,19 @@ mod tests {
         sync::{Arc, OnceLock},
     };
 
-    use rose_data::{AbilityType, SkillDatabase, SkillId};
-    use rose_data_irose::{get_skill_database, get_string_database};
+    use rand::{rngs::mock::StepRng, Rng};
+    use rose_data::{AbilityType, ItemDatabase, SkillDatabase, SkillId};
+    use rose_data_irose::{get_item_database, get_skill_database, get_string_database};
     use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
-    use rose_game_common::components::{SkillList, SkillPage};
+    use rose_game_common::components::{
+        AbilityValues, AbilityValuesAdjust, BasicStats, DamageCategory, DamageType, Equipment,
+        Level, SkillList, SkillPage,
+    };
 
     use super::{
-        calculate_drop_rate, calculate_passive_skill_ability_values, EquipmentAbilityValue,
-        IroseSkillPageType,
+        calculate_avoid, calculate_damage_success_rate, calculate_drop_rate, calculate_hit,
+        calculate_passive_skill_ability_values, calculate_pvp_damage_success_rate,
+        EquipmentAbilityValue, IroseSkillPageType, PassiveSkillAbilityValues,
     };
 
     fn asset_root() -> PathBuf {
@@ -2361,6 +2378,86 @@ mod tests {
                     .expect("workspace skill database should load"),
             )
         })
+    }
+
+    fn load_item_database() -> &'static Arc<ItemDatabase> {
+        static ITEM_DATABASE: OnceLock<Arc<ItemDatabase>> = OnceLock::new();
+
+        ITEM_DATABASE.get_or_init(|| {
+            let vfs =
+                VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(asset_root()))]);
+            let string_database =
+                get_string_database(&vfs, 0).expect("workspace string database should load");
+            Arc::new(
+                get_item_database(&vfs, string_database)
+                    .expect("workspace item database should load"),
+            )
+        })
+    }
+
+    fn test_ability_values(
+        damage_category: DamageCategory,
+        level: i32,
+        hit: i32,
+        avoid: i32,
+    ) -> AbilityValues {
+        AbilityValues {
+            is_driving: false,
+            damage_category,
+            level,
+            walk_speed: 0.0,
+            run_speed: 0.0,
+            vehicle_move_speed: 0.0,
+            strength: 0,
+            dexterity: 0,
+            intelligence: 0,
+            concentration: 0,
+            charm: 0,
+            sense: 0,
+            max_health: 100,
+            max_mana: 100,
+            additional_health_recovery: 0,
+            additional_mana_recovery: 0,
+            attack_damage_type: DamageType::Physical,
+            attack_power: 0,
+            attack_speed: 0,
+            passive_attack_speed: 0,
+            attack_range: 0,
+            hit,
+            defence: 0,
+            resistance: 0,
+            critical: 0,
+            avoid,
+            vehicle_attack_power: 0,
+            vehicle_attack_range: 0,
+            vehicle_attack_speed: 0,
+            vehicle_hit: 0,
+            vehicle_defence: 0,
+            vehicle_critical: 0,
+            vehicle_avoid: 0,
+            max_damage_sources: 1,
+            drop_rate: 0,
+            max_weight: 0,
+            summon_owner_level: None,
+            summon_skill_level: None,
+            adjust: AbilityValuesAdjust {
+                additional_damage_multiplier: 0.0,
+                attack_speed: 0,
+                attack_power: 0,
+                avoid: 0,
+                critical: 0,
+                defence: 0,
+                hit: 0,
+                resistance: 0,
+                max_health: 0,
+                max_mana: 0,
+                run_speed: 0.0,
+            },
+            npc_store_buy_rate: 0,
+            npc_store_sell_rate: 0,
+            save_mana: 0,
+            passive_max_summons: 0,
+        }
     }
 
     #[test]
@@ -2394,6 +2491,93 @@ mod tests {
         assert_eq!(
             calculate_drop_rate(&EquipmentAbilityValue::default(), &passive_ability_values),
             14
+        );
+    }
+
+    #[test]
+    fn pvp_success_rate_matches_corrected_legacy_formula() {
+        assert_eq!(calculate_pvp_damage_success_rate(120, 80, 37), 22);
+    }
+
+    #[test]
+    fn pvp_success_rate_no_longer_depends_on_attacker_avoid() {
+        let attacker_low_avoid = test_ability_values(DamageCategory::Character, 70, 150, 15);
+        let attacker_high_avoid = test_ability_values(DamageCategory::Character, 70, 150, 999);
+        let defender = test_ability_values(DamageCategory::Character, 68, 0, 80);
+        let mut rng_low_avoid = StepRng::new(17, 0);
+        let mut rng_high_avoid = rng_low_avoid.clone();
+
+        let low_avoid_result =
+            calculate_damage_success_rate(&mut rng_low_avoid, &attacker_low_avoid, &defender);
+        let high_avoid_result =
+            calculate_damage_success_rate(&mut rng_high_avoid, &attacker_high_avoid, &defender);
+
+        assert_eq!(low_avoid_result, high_avoid_result);
+    }
+
+    #[test]
+    fn non_pvp_success_rate_is_unchanged() {
+        let attacker = test_ability_values(DamageCategory::Character, 70, 120, 25);
+        let defender = test_ability_values(DamageCategory::Npc, 55, 0, 45);
+        let mut actual_rng = StepRng::new(9, 0);
+        let mut expected_rng = actual_rng.clone();
+
+        let value = (attacker.get_level() + 10) - (defender.get_level() as f32 * 1.1) as i32
+            + expected_rng.gen_range(1..=50);
+        let expected = if value <= 0 {
+            0
+        } else {
+            (value as f32
+                * ((attacker.get_hit() as f32 * 1.1 - defender.get_avoid() as f32 * 0.93
+                    + expected_rng.gen_range(1..=60) as f32
+                    + 5.0
+                    + attacker.get_level() as f32 * 0.2)
+                    / 80.0)) as i32
+        };
+
+        assert_eq!(
+            calculate_damage_success_rate(&mut actual_rng, &attacker, &defender),
+            expected
+        );
+    }
+
+    #[test]
+    fn hit_and_avoid_stat_fixtures_remain_unchanged() {
+        let item_database = load_item_database();
+        let equipment = Equipment::default();
+        let basic_stats = BasicStats {
+            dexterity: 40,
+            concentration: 35,
+            ..BasicStats::default()
+        };
+        let level = Level::new(50);
+        let equipment_ability_values = EquipmentAbilityValue {
+            hit: 5,
+            avoid: 7,
+            ..EquipmentAbilityValue::default()
+        };
+        let passive_ability_values = PassiveSkillAbilityValues::default();
+
+        assert_eq!(
+            calculate_hit(
+                item_database.as_ref(),
+                &basic_stats,
+                &equipment_ability_values,
+                &equipment,
+                &passive_ability_values,
+            ),
+            42
+        );
+        assert_eq!(
+            calculate_avoid(
+                item_database.as_ref(),
+                &basic_stats,
+                &level,
+                &equipment,
+                &equipment_ability_values,
+                &passive_ability_values,
+            ),
+            47
         );
     }
 }

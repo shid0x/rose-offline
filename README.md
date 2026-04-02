@@ -60,7 +60,6 @@ You can change the AA setting. FXAA works but is fairly experimental; the curren
 - Item lifespan is not implemented (mainly because it is a shitty mechanic )
 - Flying ships are not visible when changing planets
 - Event items (Christmas tree) are not implemented, mainly because they are hardcoded and tedious to add one by one
-- Some monsters walk (yes); when chasing you, they move at a slower speed. Never tried to fix it — it looked fun.
 - Figthing under bonfires can look a little strange : Server side : Healed before receiving the hit, Client side : Healed after receiving the hit. So you might see yourself at 1HP for a second if you were low on HP.
 
 

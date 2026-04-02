@@ -106,6 +106,7 @@ impl NextCommand {
                 use_item,
                 cast_motion_id: None,
                 action_motion_id: None,
+                restore_command: None,
             }),
             has_sent_server_message: false,
         }
@@ -123,6 +124,7 @@ impl NextCommand {
                 use_item,
                 cast_motion_id: None,
                 action_motion_id: None,
+                restore_command: None,
             }),
             has_sent_server_message: false,
         }
@@ -136,6 +138,7 @@ impl NextCommand {
                 use_item: None,
                 cast_motion_id: None,
                 action_motion_id: None,
+                restore_command: None,
             }),
             has_sent_server_message: false,
         }
@@ -146,6 +149,7 @@ impl NextCommand {
         target_entity: Entity,
         cast_motion_id: MotionId,
         action_motion_id: MotionId,
+        restore_command: Option<CommandData>,
     ) -> Self {
         Self {
             command: Some(CommandData::CastSkill {
@@ -154,6 +158,7 @@ impl NextCommand {
                 use_item: None,
                 cast_motion_id: Some(cast_motion_id),
                 action_motion_id: Some(action_motion_id),
+                restore_command: restore_command.map(Box::new),
             }),
             has_sent_server_message: false,
         }
@@ -163,6 +168,7 @@ impl NextCommand {
         skill_id: SkillId,
         cast_motion_id: MotionId,
         action_motion_id: MotionId,
+        restore_command: Option<CommandData>,
     ) -> Self {
         Self {
             command: Some(CommandData::CastSkill {
@@ -171,6 +177,7 @@ impl NextCommand {
                 use_item: None,
                 cast_motion_id: Some(cast_motion_id),
                 action_motion_id: Some(action_motion_id),
+                restore_command: restore_command.map(Box::new),
             }),
             has_sent_server_message: false,
         }

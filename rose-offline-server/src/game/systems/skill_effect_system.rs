@@ -22,10 +22,10 @@ use super::bonfire_aura_system::{create_bonfire_aura, is_bonfire_skill};
 use crate::game::{
     bundles::{ability_values_get_value, MonsterBundle, GLOBAL_SKILL_COOLDOWN},
     components::{
-        AbilityValues, ClanMembership, ClientEntity, ClientEntityType, Cooldowns, Dead,
+        AbilityValues, ClanMembership, ClientEntity, ClientEntityType, Command, Cooldowns, Dead,
         ExperiencePoints, GameClient, HealthPoints, Inventory, Level, ManaPoints, MoveMode,
-        MoveSpeed, PartyMembership, Position, SpawnOrigin, Stamina, StatusEffects, SummonPointCost,
-        SummonUsage, Team,
+        MoveSpeed, NextCommand, PartyMembership, Position, SpawnOrigin, Stamina, StatusEffects,
+        SummonPointCost, SummonUsage, Team,
     },
     events::{DamageEvent, ItemLifeEvent, SkillEvent, SkillEventTarget},
     messages::server::{CancelCastingSkillReason, ServerMessage},
@@ -102,8 +102,89 @@ pub struct SkillTargetQuery<'w> {
 
     health_points: &'w mut HealthPoints,
     mana_points: Option<&'w mut ManaPoints>,
+    command: &'w mut Command,
+    next_command: &'w mut NextCommand,
     stamina: Option<&'w mut Stamina>,
     status_effects: &'w mut StatusEffects,
+}
+
+fn stop_action_disabled_target(
+    server_messages: &mut ServerMessages,
+    client_entity: &ClientEntity,
+    position: &Position,
+    command: &mut Command,
+    next_command: &mut NextCommand,
+) {
+    let should_send_stop = !command.is_stop() || next_command.command.is_some();
+
+    *command = Command::with_stop();
+    *next_command = NextCommand::default();
+
+    if should_send_stop {
+        server_messages.send_entity_message(
+            client_entity,
+            ServerMessage::StopMoveEntity {
+                entity_id: client_entity.id,
+                x: position.position.x,
+                y: position.position.y,
+                z: position.position.z as u16,
+            },
+        );
+    }
+}
+
+fn stop_skill_use_disabled_target(
+    server_messages: &mut ServerMessages,
+    client_entity: &ClientEntity,
+    position: &Position,
+    command: &mut Command,
+    next_command: &mut NextCommand,
+) {
+    let should_send_stop = matches!(
+        &command.command,
+        crate::game::components::CommandData::CastSkill { .. }
+    );
+    let should_clear_next = next_command.command.as_ref().is_some_and(|command| {
+        matches!(
+            command,
+            crate::game::components::CommandData::CastSkill { .. }
+        )
+    });
+
+    if should_send_stop {
+        *command = Command::with_stop();
+    }
+
+    if should_clear_next {
+        *next_command = NextCommand::default();
+    }
+
+    if should_send_stop {
+        server_messages.send_entity_message(
+            client_entity,
+            ServerMessage::StopMoveEntity {
+                entity_id: client_entity.id,
+                x: position.position.x,
+                y: position.position.y,
+                z: position.position.z as u16,
+            },
+        );
+    }
+}
+
+fn send_skill_target_status_effects_update(
+    server_messages: &mut ServerMessages,
+    client_entity: &ClientEntity,
+    status_effects: &StatusEffects,
+) {
+    server_messages.send_entity_message(
+        client_entity,
+        ServerMessage::UpdateStatusEffects {
+            entity_id: client_entity.id,
+            status_effects: status_effects.active.clone(),
+            updated_values: Vec::new(),
+        },
+    );
 }
 
 // TODO: Deduplicate code with skill_use.rs check_skill_target_filter
@@ -285,6 +366,7 @@ fn apply_skill_status_effects_to_entity(
     }
 
     let mut effect_success = [false, false];
+    let mut status_effects_updated = false;
     for (effect_index, status_effect_data) in skill_data
         .status_effects
         .iter()
@@ -365,7 +447,7 @@ fn apply_skill_status_effects_to_entity(
             .status_effects
             .can_apply(status_effect_data, adjust_value)
         {
-            skill_target.status_effects.apply_status_effect(
+            status_effects_updated |= skill_target.status_effects.apply_status_effect(
                 status_effect_data,
                 skill_system_resources.time.last_update().unwrap()
                     + skill_data.status_effect_duration,
@@ -373,8 +455,23 @@ fn apply_skill_status_effects_to_entity(
             );
 
             match status_effect_data.status_effect_type {
+                StatusEffectType::Dumb => {
+                    stop_skill_use_disabled_target(
+                        &mut skill_system_parameters.server_messages,
+                        skill_target.client_entity,
+                        skill_target.position,
+                        &mut skill_target.command,
+                        &mut skill_target.next_command,
+                    );
+                }
                 StatusEffectType::Fainting | StatusEffectType::Sleep => {
-                    // TODO: Set current + next command to stop
+                    stop_action_disabled_target(
+                        &mut skill_system_parameters.server_messages,
+                        skill_target.client_entity,
+                        skill_target.position,
+                        &mut skill_target.command,
+                        &mut skill_target.next_command,
+                    );
                 }
                 StatusEffectType::Taunt => {
                     // TODO: Set current + next command to attack spell cast entity
@@ -441,6 +538,14 @@ fn apply_skill_status_effects_to_entity(
                 effect_success,
             },
         );
+
+        if status_effects_updated {
+            send_skill_target_status_effects_update(
+                &mut skill_system_parameters.server_messages,
+                skill_target.client_entity,
+                &skill_target.status_effects,
+            );
+        }
     }
 
     Ok(())
@@ -505,6 +610,187 @@ fn apply_skill_status_effects(
         }
     } else {
         Err(SkillCastError::InvalidTarget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::{math::Vec3, prelude::Entity};
+    use rose_data::{StatusEffectId, StatusEffectType, ZoneId};
+
+    use super::{
+        send_skill_target_status_effects_update, stop_action_disabled_target,
+        stop_skill_use_disabled_target,
+    };
+    use crate::game::{
+        components::{
+            ActiveStatusEffect, ClientEntity, ClientEntityId, ClientEntityType, Command,
+            CommandData, NextCommand, Position, StatusEffects,
+        },
+        messages::server::ServerMessage,
+        resources::ServerMessages,
+    };
+    use rose_game_common::components::MoveMode;
+    use std::time::Duration;
+
+    #[test]
+    fn stop_action_disabled_target_clears_command_and_queue_and_notifies_client() {
+        let mut server_messages = ServerMessages::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(99),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::new(10.0, 20.0, 30.0), ZoneId::new(1).unwrap());
+        let mut command =
+            Command::with_move(Vec3::new(100.0, 200.0, 30.0), None, Some(MoveMode::Run));
+        let mut next_command = NextCommand::with_attack(Entity::from_raw(7));
+
+        stop_action_disabled_target(
+            &mut server_messages,
+            &client_entity,
+            &position,
+            &mut command,
+            &mut next_command,
+        );
+
+        assert!(command.is_stop());
+        assert!(next_command.command.is_none());
+        assert_eq!(server_messages.pending_entity_messages.len(), 1);
+
+        match &server_messages.pending_entity_messages[0].message {
+            ServerMessage::StopMoveEntity { entity_id, x, y, z } => {
+                assert_eq!(*entity_id, client_entity.id);
+                assert_eq!(*x, position.position.x);
+                assert_eq!(*y, position.position.y);
+                assert_eq!(*z, position.position.z as u16);
+            }
+            other => panic!("expected StopMoveEntity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stop_action_disabled_target_is_noop_for_already_stopped_targets() {
+        let mut server_messages = ServerMessages::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(100),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::new(1.0, 2.0, 3.0), ZoneId::new(1).unwrap());
+        let mut command = Command::with_stop();
+        let mut next_command = NextCommand::default();
+
+        stop_action_disabled_target(
+            &mut server_messages,
+            &client_entity,
+            &position,
+            &mut command,
+            &mut next_command,
+        );
+
+        assert!(command.is_stop());
+        assert!(next_command.command.is_none());
+        assert!(server_messages.pending_entity_messages.is_empty());
+    }
+
+    #[test]
+    fn stop_skill_use_disabled_target_clears_only_skill_commands() {
+        let mut server_messages = ServerMessages::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(102),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::new(1.0, 2.0, 3.0), ZoneId::new(1).unwrap());
+        let mut command =
+            Command::with_move(Vec3::new(100.0, 200.0, 30.0), None, Some(MoveMode::Run));
+        let mut next_command = NextCommand::with_attack(Entity::from_raw(7));
+
+        stop_skill_use_disabled_target(
+            &mut server_messages,
+            &client_entity,
+            &position,
+            &mut command,
+            &mut next_command,
+        );
+
+        assert!(matches!(command.command, CommandData::Move { .. }));
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { .. })
+        ));
+        assert!(server_messages.pending_entity_messages.is_empty());
+    }
+
+    #[test]
+    fn stop_skill_use_disabled_target_stops_active_cast_and_clears_next_cast() {
+        let mut server_messages = ServerMessages::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(103),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::new(4.0, 5.0, 6.0), ZoneId::new(1).unwrap());
+        let mut command = Command::with_cast_skill(
+            rose_data::SkillId::new(1).unwrap(),
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let mut next_command =
+            NextCommand::with_cast_skill_target_self(rose_data::SkillId::new(2).unwrap(), None);
+
+        stop_skill_use_disabled_target(
+            &mut server_messages,
+            &client_entity,
+            &position,
+            &mut command,
+            &mut next_command,
+        );
+
+        assert!(command.is_stop());
+        assert!(next_command.command.is_none());
+        assert_eq!(server_messages.pending_entity_messages.len(), 1);
+    }
+
+    #[test]
+    fn send_skill_target_status_effects_update_queues_authoritative_status_state() {
+        let mut server_messages = ServerMessages::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Character,
+            ClientEntityId(101),
+            ZoneId::new(1).unwrap(),
+        );
+        let mut status_effects = StatusEffects::default();
+        status_effects.active[StatusEffectType::DecreaseMoveSpeed] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(7).unwrap(),
+            value: 42,
+        });
+
+        send_skill_target_status_effects_update(
+            &mut server_messages,
+            &client_entity,
+            &status_effects,
+        );
+
+        assert_eq!(server_messages.pending_entity_messages.len(), 1);
+        match &server_messages.pending_entity_messages[0].message {
+            ServerMessage::UpdateStatusEffects {
+                entity_id,
+                status_effects,
+                updated_values,
+            } => {
+                assert_eq!(*entity_id, client_entity.id);
+                let slow_effect = status_effects[StatusEffectType::DecreaseMoveSpeed]
+                    .as_ref()
+                    .expect("slow should be present");
+                assert_eq!(slow_effect.id, StatusEffectId::new(7).unwrap());
+                assert_eq!(slow_effect.value, 42);
+                assert!(updated_values.is_empty());
+            }
+            other => panic!("expected UpdateStatusEffects, got {:?}", other),
+        }
     }
 }
 

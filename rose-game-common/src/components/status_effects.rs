@@ -129,4 +129,75 @@ impl StatusEffects {
             .as_ref()
             .map(|status_effect| status_effect.value)
     }
+
+    pub fn is_action_disabled(&self) -> bool {
+        self.active[StatusEffectType::Sleep].is_some()
+            || self.active[StatusEffectType::Fainting].is_some()
+    }
+
+    pub fn is_skill_use_disabled(&self) -> bool {
+        self.active[StatusEffectType::Dumb].is_some() || self.is_action_disabled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActiveStatusEffect, StatusEffects};
+    use rose_data::{StatusEffectId, StatusEffectType};
+
+    fn apply_status_effect(
+        status_effects: &mut StatusEffects,
+        status_effect_type: StatusEffectType,
+    ) {
+        status_effects.active[status_effect_type] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(1).unwrap(),
+            value: 1,
+        });
+    }
+
+    #[test]
+    fn action_disabled_matches_sleep_and_fainting() {
+        let mut status_effects = StatusEffects::default();
+        assert!(!status_effects.is_action_disabled());
+
+        apply_status_effect(&mut status_effects, StatusEffectType::Sleep);
+        assert!(status_effects.is_action_disabled());
+
+        status_effects.active[StatusEffectType::Sleep] = None;
+        apply_status_effect(&mut status_effects, StatusEffectType::Fainting);
+        assert!(status_effects.is_action_disabled());
+    }
+
+    #[test]
+    fn action_disabled_ignores_other_bad_status_effects() {
+        let mut status_effects = StatusEffects::default();
+        apply_status_effect(&mut status_effects, StatusEffectType::Poisoned);
+
+        assert!(!status_effects.is_action_disabled());
+    }
+
+    #[test]
+    fn action_disabled_ignores_dumb() {
+        let mut status_effects = StatusEffects::default();
+        apply_status_effect(&mut status_effects, StatusEffectType::Dumb);
+
+        assert!(!status_effects.is_action_disabled());
+    }
+
+    #[test]
+    fn skill_use_disabled_matches_dumb_sleep_and_fainting() {
+        let mut status_effects = StatusEffects::default();
+        assert!(!status_effects.is_skill_use_disabled());
+
+        apply_status_effect(&mut status_effects, StatusEffectType::Dumb);
+        assert!(status_effects.is_skill_use_disabled());
+
+        status_effects.active[StatusEffectType::Dumb] = None;
+        apply_status_effect(&mut status_effects, StatusEffectType::Sleep);
+        assert!(status_effects.is_skill_use_disabled());
+
+        status_effects.active[StatusEffectType::Sleep] = None;
+        apply_status_effect(&mut status_effects, StatusEffectType::Fainting);
+        assert!(status_effects.is_skill_use_disabled());
+    }
 }

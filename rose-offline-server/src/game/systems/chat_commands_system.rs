@@ -348,7 +348,9 @@ impl From<ParseFloatError> for ChatCommandError {
     }
 }
 
-fn canonical_poison_status_effect(game_data: &GameData) -> Result<&StatusEffectData, ChatCommandError> {
+fn canonical_poison_status_effect(
+    game_data: &GameData,
+) -> Result<&StatusEffectData, ChatCommandError> {
     let status_effect_id = default_poison_status_effect_id();
     game_data
         .status_effects
@@ -726,7 +728,8 @@ fn handle_chat_command(
                 .map(|value| value.parse::<u64>())
                 .transpose()?
                 .unwrap_or(DEFAULT_POISON_DURATION_SECONDS);
-            let status_effect_data = canonical_poison_status_effect(&chat_command_params.game_data)?;
+            let status_effect_data =
+                canonical_poison_status_effect(&chat_command_params.game_data)?;
             let expire_time =
                 chat_command_params.time.last_update().unwrap() + Duration::from_secs(seconds);
 

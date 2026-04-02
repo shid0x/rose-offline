@@ -24,7 +24,7 @@ use crate::game::{
         AbilityValues, ClientEntity, ClientEntitySector, ClientEntityType, Command,
         CommandCastSkillTarget, CommandData, Equipment, GameClient, HealthPoints, ItemDrop,
         MotionData, MoveMode, MoveSpeed, NextCommand, Npc, Owner, PartyOwner, PersonalStore,
-        Position, Team,
+        Position, StatusEffects, Team,
     },
     events::{
         DamageEvent, ItemLifeEvent, PickupItemEvent, SkillEvent, SkillEventTarget, UseAmmoEvent,
@@ -52,6 +52,7 @@ pub struct QueryCommandEntity<'w> {
     motion_data: &'w MotionData,
     move_mode: &'w MoveMode,
     position: &'w Position,
+    status_effects: &'w StatusEffects,
     team: &'w Team,
 
     character_info: Option<&'w CharacterInfo>,
@@ -106,6 +107,73 @@ fn command_stop(
     }
 
     *command = Command::with_stop();
+}
+
+fn command_is_blocked_by_action_disable(command: &CommandData) -> bool {
+    !matches!(command, CommandData::Stop { .. } | CommandData::Die { .. })
+}
+
+fn command_is_blocked_by_skill_disable(command: &CommandData) -> bool {
+    matches!(command, CommandData::CastSkill { .. })
+}
+
+fn clear_skill_use_disabled_target(
+    command: &mut Command,
+    next_command: &mut NextCommand,
+    client_entity: &ClientEntity,
+    position: &Position,
+    server_messages: &mut ServerMessages,
+) -> bool {
+    let should_stop_current = command_is_blocked_by_skill_disable(&command.command);
+    let should_clear_next = next_command
+        .command
+        .as_ref()
+        .is_some_and(command_is_blocked_by_skill_disable);
+
+    if should_stop_current {
+        command_stop(command, client_entity, position, Some(server_messages));
+    }
+
+    if should_clear_next {
+        *next_command = NextCommand::default();
+    }
+
+    should_stop_current
+}
+
+fn get_skill_followup_command(
+    action_mode: SkillActionMode,
+    target_entity: Option<Entity>,
+    current_command: &CommandData,
+    stored_restore_command: Option<&CommandData>,
+) -> NextCommand {
+    match action_mode {
+        SkillActionMode::Stop => NextCommand::default(),
+        SkillActionMode::Attack => target_entity.map_or_else(NextCommand::default, |target| {
+            NextCommand::with_command_skip_server_message(CommandData::Attack { target })
+        }),
+        SkillActionMode::Restore => {
+            if let Some(restore_command) = stored_restore_command {
+                return NextCommand::with_command_skip_server_message(restore_command.clone());
+            }
+
+            match current_command {
+                CommandData::Stop { .. }
+                | CommandData::Move { .. }
+                | CommandData::Attack { .. } => {
+                    NextCommand::with_command_skip_server_message(current_command.clone())
+                }
+                CommandData::Die { .. }
+                | CommandData::Emote { .. }
+                | CommandData::PickupItemDrop { .. }
+                | CommandData::PersonalStore
+                | CommandData::Sit
+                | CommandData::Sitting
+                | CommandData::Standing
+                | CommandData::CastSkill { .. } => NextCommand::default(),
+            }
+        }
+    }
 }
 
 fn is_valid_move_target(target: &CommandMoveTargetQueryItem, position: &Position) -> bool {
@@ -265,6 +333,23 @@ fn is_summon_points_limited(
         > skill_caster.ability_values.get_max_summon_points()
 }
 
+fn sync_npc_combat_chase_move_speed(
+    commands: &mut Commands,
+    entity: Entity,
+    ability_values: &AbilityValues,
+    npc: Option<&Npc>,
+) {
+    if npc.is_none() {
+        return;
+    }
+
+    let move_mode = MoveMode::Run;
+    commands.entity(entity).insert((
+        move_mode,
+        MoveSpeed::new(ability_values.get_move_speed(&move_mode)),
+    ));
+}
+
 pub fn command_system(
     mut commands: Commands,
     mut query_command_entity: Query<QueryCommandEntity>,
@@ -291,6 +376,40 @@ pub fn command_system(
         if command_entity.command.is_dead() {
             // Ignore all requested commands whilst dead.
             command_entity.next_command.command = None;
+        }
+
+        if !command_entity.command.is_dead() && command_entity.status_effects.is_action_disabled() {
+            let should_stop_current =
+                command_is_blocked_by_action_disable(&command_entity.command.command);
+            let should_clear_next = command_entity.next_command.command.is_some();
+
+            if should_stop_current {
+                command_stop(
+                    &mut command_entity.command,
+                    command_entity.client_entity,
+                    command_entity.position,
+                    Some(&mut server_messages),
+                );
+            }
+
+            if should_clear_next {
+                *command_entity.next_command = NextCommand::default();
+            }
+
+            continue;
+        }
+
+        if !command_entity.command.is_dead()
+            && command_entity.status_effects.is_skill_use_disabled()
+            && clear_skill_use_disabled_target(
+                &mut command_entity.command,
+                &mut command_entity.next_command,
+                command_entity.client_entity,
+                command_entity.position,
+                &mut server_messages,
+            )
+        {
+            continue;
         }
 
         if !command_entity.next_command.has_sent_server_message
@@ -693,6 +812,13 @@ pub fn command_system(
                     .xy()
                     .distance(target.position.position.xy());
                 if attack_range < distance {
+                    sync_npc_combat_chase_move_speed(
+                        &mut commands,
+                        command_entity.entity,
+                        command_entity.ability_values,
+                        command_entity.npc,
+                    );
+
                     // Not in range, set current command to move
                     *command_entity.command = Command::with_move(
                         target.position.position,
@@ -822,7 +948,10 @@ pub fn command_system(
                 ref use_item,
                 cast_motion_id,
                 action_motion_id,
+                ref restore_command,
             } => {
+                let stored_restore_command = restore_command.as_deref().cloned();
+
                 if !can_cast_skill(
                     now,
                     &game_data,
@@ -850,7 +979,10 @@ pub fn command_system(
 
                     // Cannot use skill (e.g. insufficient MP). Discard the cast request but
                     // preserve current combat intent to avoid breaking auto-attack state.
-                    if let Some(target_entity) = command_entity.command.target_entity() {
+                    if let Some(restore_command) = stored_restore_command.as_ref() {
+                        *command_entity.next_command =
+                            NextCommand::with_command_skip_server_message(restore_command.clone());
+                    } else if let Some(target_entity) = command_entity.command.target_entity() {
                         *command_entity.next_command =
                             NextCommand::with_command_skip_server_message(CommandData::Attack {
                                 target: target_entity,
@@ -890,8 +1022,15 @@ pub fn command_system(
                         < cast_range * cast_range
                 });
                 if !in_distance {
-                    // Not in range, set current command to move
-                    // TODO: By changing command to move here we affect SkillActionMode::Restore, should save current command
+                    sync_npc_combat_chase_move_speed(
+                        &mut commands,
+                        command_entity.entity,
+                        command_entity.ability_values,
+                        command_entity.npc,
+                    );
+
+                    // Temporary movement to reach cast range should not overwrite the
+                    // pre-skill combat intent stored on the queued skill command.
                     *command_entity.command = Command::with_move(
                         target_position.unwrap(),
                         target_entity,
@@ -962,44 +1101,20 @@ pub fn command_system(
                 ));
 
                 // Update next command
-                match skill_data.action_mode {
-                    SkillActionMode::Stop => *command_entity.next_command = NextCommand::default(),
-                    SkillActionMode::Attack => {
-                        *command_entity.next_command =
-                            target_entity.map_or_else(NextCommand::default, |target| {
-                                NextCommand::with_command_skip_server_message(CommandData::Attack {
-                                    target,
-                                })
-                            })
-                    }
-                    SkillActionMode::Restore => match command_entity.command.command {
-                        CommandData::Stop { .. }
-                        | CommandData::Move { .. }
-                        | CommandData::Attack { .. } => {
-                            *command_entity.next_command =
-                                NextCommand::with_command_skip_server_message(
-                                    command_entity.command.command.clone(),
-                                )
-                        }
-                        CommandData::Die { .. }
-                        | CommandData::Emote { .. }
-                        | CommandData::PickupItemDrop { .. }
-                        | CommandData::PersonalStore
-                        | CommandData::Sit
-                        | CommandData::Sitting
-                        | CommandData::Standing
-                        | CommandData::CastSkill { .. } => {
-                            *command_entity.next_command = NextCommand::default()
-                        }
-                    },
-                }
+                *command_entity.next_command = get_skill_followup_command(
+                    skill_data.action_mode,
+                    target_entity,
+                    &command_entity.command.command,
+                    stored_restore_command.as_ref(),
+                );
 
                 // Set current command to cast skill
-                *command_entity.command = Command::with_cast_skill(
+                *command_entity.command = Command::with_cast_skill_restore(
                     skill_id,
                     skill_target,
                     casting_duration,
                     action_duration,
+                    stored_restore_command,
                 );
             }
             CommandData::PersonalStore => {
@@ -1070,6 +1185,713 @@ pub fn command_system(
                 *command_entity.next_command = NextCommand::default();
             }
             CommandData::Die { .. } => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use bevy::{
+        app::{App, Update},
+        math::{UVec2, Vec3},
+        time::Time,
+    };
+    use rose_data::{CharacterMotionDatabaseOptions, NpcDatabaseOptions, SkillActionMode, ZoneId};
+    use rose_data_irose::{
+        get_ai_database, get_character_motion_database, get_data_decoder, get_item_database,
+        get_job_class_database, get_npc_database, get_product_database, get_quest_database,
+        get_skill_database, get_status_effect_database, get_string_database,
+        get_warp_gate_database, get_zone_database,
+    };
+    use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
+    use rose_game_common::components::{BasicStats, CharacterGender};
+    use rose_game_irose::data::{get_ability_value_calculator, get_drop_table};
+
+    use super::{
+        clear_skill_use_disabled_target, command_is_blocked_by_action_disable,
+        command_is_blocked_by_skill_disable, command_system, get_skill_followup_command,
+    };
+    use crate::game::{
+        components::{
+            ClientEntity, ClientEntityId, ClientEntityType, Command, CommandData, NextCommand,
+            Position,
+        },
+        components::{
+            ClientEntitySector, Cooldowns, HealthPoints, MotionData, MoveMode, MoveSpeed, Npc,
+            StatusEffects, Team,
+        },
+        events::{DamageEvent, ItemLifeEvent, PickupItemEvent, SkillEvent, UseAmmoEvent},
+        resources::{GameData, ServerMessages, ZoneList},
+        storage::character::{CharacterCreator, CharacterCreatorError, CharacterStorage},
+    };
+
+    #[test]
+    fn action_disabled_commands_allow_only_stop_and_die() {
+        assert!(!command_is_blocked_by_action_disable(&CommandData::Stop {
+            send_message: false,
+        }));
+        assert!(!command_is_blocked_by_action_disable(&CommandData::Die {
+            killer: None,
+            damage: None,
+        }));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Move {
+            destination: Default::default(),
+            target: None,
+            move_mode: None,
+        }));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Attack {
+            target: bevy::prelude::Entity::from_raw(1),
+        }));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Emote {
+            motion_id: rose_data::MotionId::new(1),
+            is_stop: false,
+        }));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Sitting));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Standing));
+        assert!(command_is_blocked_by_action_disable(&CommandData::Sit));
+        assert!(command_is_blocked_by_action_disable(
+            &CommandData::PersonalStore
+        ));
+        assert!(command_is_blocked_by_action_disable(
+            &CommandData::PickupItemDrop {
+                target: bevy::prelude::Entity::from_raw(2),
+            }
+        ));
+        assert!(command_is_blocked_by_action_disable(
+            &CommandData::CastSkill {
+                skill_id: rose_data::SkillId::new(1).unwrap(),
+                skill_target: None,
+                use_item: None,
+                cast_motion_id: None,
+                action_motion_id: None,
+                restore_command: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn skill_disabled_only_blocks_cast_skill_commands() {
+        assert!(!command_is_blocked_by_skill_disable(&CommandData::Stop {
+            send_message: false,
+        }));
+        assert!(!command_is_blocked_by_skill_disable(&CommandData::Move {
+            destination: Default::default(),
+            target: None,
+            move_mode: None,
+        }));
+        assert!(!command_is_blocked_by_skill_disable(&CommandData::Attack {
+            target: bevy::prelude::Entity::from_raw(1),
+        }));
+        assert!(command_is_blocked_by_skill_disable(
+            &CommandData::CastSkill {
+                skill_id: rose_data::SkillId::new(1).unwrap(),
+                skill_target: None,
+                use_item: None,
+                cast_motion_id: None,
+                action_motion_id: None,
+                restore_command: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn restore_skill_followup_prefers_stored_attack_command() {
+        let target_entity = bevy::prelude::Entity::from_raw(7);
+        let current_command = CommandData::Move {
+            destination: Vec3::new(10.0, 0.0, 0.0),
+            target: Some(target_entity),
+            move_mode: Some(MoveMode::Run),
+        };
+        let stored_restore = CommandData::Attack {
+            target: target_entity,
+        };
+
+        let next_command = get_skill_followup_command(
+            SkillActionMode::Restore,
+            Some(target_entity),
+            &current_command,
+            Some(&stored_restore),
+        );
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == target_entity
+        ));
+        assert!(next_command.has_sent_server_message);
+    }
+
+    #[test]
+    fn restore_skill_followup_uses_current_command_when_no_stored_restore_exists() {
+        let target_entity = bevy::prelude::Entity::from_raw(8);
+        let current_command = CommandData::Move {
+            destination: Vec3::new(20.0, 0.0, 0.0),
+            target: Some(target_entity),
+            move_mode: Some(MoveMode::Run),
+        };
+
+        let next_command = get_skill_followup_command(
+            SkillActionMode::Restore,
+            Some(target_entity),
+            &current_command,
+            None,
+        );
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Move {
+                target: Some(target),
+                ..
+            }) if target == target_entity
+        ));
+        assert!(next_command.has_sent_server_message);
+    }
+
+    #[test]
+    fn attack_and_stop_skill_followups_keep_existing_behavior() {
+        let target_entity = bevy::prelude::Entity::from_raw(9);
+        let current_command = CommandData::Stop {
+            send_message: false,
+        };
+
+        let attack_followup = get_skill_followup_command(
+            SkillActionMode::Attack,
+            Some(target_entity),
+            &current_command,
+            None,
+        );
+        let stop_followup = get_skill_followup_command(
+            SkillActionMode::Stop,
+            Some(target_entity),
+            &current_command,
+            None,
+        );
+
+        assert!(matches!(
+            attack_followup.command,
+            Some(CommandData::Attack { target }) if target == target_entity
+        ));
+        assert!(attack_followup.has_sent_server_message);
+        assert!(stop_followup.command.is_none());
+    }
+
+    #[test]
+    fn skill_disabled_clears_only_cast_commands() {
+        let mut command = Command::with_move(Vec3::new(10.0, 20.0, 0.0), None, Some(MoveMode::Run));
+        let mut next_command =
+            NextCommand::with_cast_skill_target_self(rose_data::SkillId::new(1).unwrap(), None);
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Character,
+            ClientEntityId(1),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::ZERO, ZoneId::new(1).unwrap());
+        let mut server_messages = ServerMessages::default();
+
+        let stopped_current = clear_skill_use_disabled_target(
+            &mut command,
+            &mut next_command,
+            &client_entity,
+            &position,
+            &mut server_messages,
+        );
+
+        assert!(!stopped_current);
+        assert!(matches!(command.command, CommandData::Move { .. }));
+        assert!(next_command.command.is_none());
+        assert!(server_messages.pending_entity_messages.is_empty());
+    }
+
+    #[test]
+    fn skill_disabled_stops_active_cast_and_notifies_client() {
+        let mut command = Command::with_cast_skill(
+            rose_data::SkillId::new(1).unwrap(),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+        let mut next_command = NextCommand::default();
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Character,
+            ClientEntityId(2),
+            ZoneId::new(1).unwrap(),
+        );
+        let position = Position::new(Vec3::new(5.0, 6.0, 7.0), ZoneId::new(1).unwrap());
+        let mut server_messages = ServerMessages::default();
+
+        let stopped_current = clear_skill_use_disabled_target(
+            &mut command,
+            &mut next_command,
+            &client_entity,
+            &position,
+            &mut server_messages,
+        );
+
+        assert!(stopped_current);
+        assert!(command.is_stop());
+        assert_eq!(server_messages.pending_entity_messages.len(), 1);
+    }
+
+    #[test]
+    fn npc_attack_chase_switches_to_run_move_mode_and_speed() {
+        let game_data = load_test_game_data();
+        let npc_data = game_data
+            .npcs
+            .iter()
+            .find(|npc| npc.attack_range > 0)
+            .expect("expected at least one attack-capable npc in test data");
+        let npc_id = npc_data.id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+        let ability_values = game_data
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+        let walk_speed = ability_values.get_move_speed(&MoveMode::Walk);
+        let run_speed = ability_values.get_move_speed(&MoveMode::Run);
+        let far_target_position = Vec3::new(
+            ability_values.get_attack_range().max(100) as f32 * 2.0 + 500.0,
+            0.0,
+            0.0,
+        );
+
+        let mut app = App::new();
+        app.insert_resource(Time::default());
+        app.insert_resource(ServerMessages::default());
+        app.insert_resource(ZoneList::new());
+        app.insert_resource(game_data);
+        app.add_event::<DamageEvent>();
+        app.add_event::<SkillEvent>();
+        app.add_event::<PickupItemEvent>();
+        app.add_event::<ItemLifeEvent>();
+        app.add_event::<UseAmmoEvent>();
+        app.add_systems(Update, command_system);
+
+        let target_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Character, ClientEntityId(2), zone_id),
+                ability_values.clone(),
+                HealthPoints::new(100),
+                Position::new(far_target_position, zone_id),
+                Team::default_character(),
+            ))
+            .id();
+
+        let caster_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                ClientEntitySector::new(UVec2::ZERO),
+                Command::with_stop(),
+                NextCommand::with_attack(target_entity),
+                ability_values,
+                MotionData::from_npc(&app.world.resource::<GameData>().npcs, npc_id),
+                MoveMode::Walk,
+                MoveSpeed::new(walk_speed),
+                Position::new(Vec3::ZERO, zone_id),
+                StatusEffects::default(),
+                Team::default_monster(),
+                HealthPoints::new(100),
+                Npc::new(npc_id, 0),
+                Cooldowns::default(),
+            ))
+            .id();
+
+        advance_time(&mut app, Duration::from_millis(50));
+        app.update();
+
+        let command = app
+            .world
+            .get::<Command>(caster_entity)
+            .expect("expected current command after chase starts");
+        let move_mode = app
+            .world
+            .get::<MoveMode>(caster_entity)
+            .expect("expected move mode after chase starts");
+        let move_speed = app
+            .world
+            .get::<MoveSpeed>(caster_entity)
+            .expect("expected move speed after chase starts");
+
+        assert!(matches!(
+            command.command,
+            CommandData::Move {
+                target: Some(target),
+                move_mode: Some(MoveMode::Run),
+                ..
+            } if target == target_entity
+        ));
+        assert_eq!(*move_mode, MoveMode::Run);
+        assert_eq!(move_speed.speed, run_speed);
+    }
+
+    #[test]
+    fn npc_cast_skill_chase_switches_to_run_move_mode_and_speed() {
+        let game_data = load_test_game_data();
+        let npc_data = game_data
+            .npcs
+            .iter()
+            .find(|npc| npc.attack_range > 0)
+            .expect("expected at least one attack-capable npc in test data");
+        let npc_id = npc_data.id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+        let ability_values = game_data
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+        let walk_speed = ability_values.get_move_speed(&MoveMode::Walk);
+        let run_speed = ability_values.get_move_speed(&MoveMode::Run);
+        let far_target_position = Vec3::new(
+            ability_values.get_attack_range().max(100) as f32 * 2.0 + 500.0,
+            0.0,
+            0.0,
+        );
+        let skill_id = rose_data::SkillId::new(2983).expect("expected restore-mode npc skill");
+        let cast_motion_id = rose_data::MotionId::new(8);
+        let action_motion_id = rose_data::MotionId::new(9);
+
+        let mut app = App::new();
+        app.insert_resource(Time::default());
+        app.insert_resource(ServerMessages::default());
+        app.insert_resource(ZoneList::new());
+        app.insert_resource(game_data);
+        app.add_event::<DamageEvent>();
+        app.add_event::<SkillEvent>();
+        app.add_event::<PickupItemEvent>();
+        app.add_event::<ItemLifeEvent>();
+        app.add_event::<UseAmmoEvent>();
+        app.add_systems(Update, command_system);
+
+        let target_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Character, ClientEntityId(2), zone_id),
+                ability_values.clone(),
+                HealthPoints::new(100),
+                Position::new(far_target_position, zone_id),
+                Team::default_character(),
+            ))
+            .id();
+
+        let caster_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                ClientEntitySector::new(UVec2::ZERO),
+                Command::with_stop(),
+                NextCommand::with_npc_cast_skill_target(
+                    skill_id,
+                    target_entity,
+                    cast_motion_id,
+                    action_motion_id,
+                    Some(CommandData::Attack {
+                        target: target_entity,
+                    }),
+                ),
+                ability_values,
+                MotionData::from_npc(&app.world.resource::<GameData>().npcs, npc_id),
+                MoveMode::Walk,
+                MoveSpeed::new(walk_speed),
+                Position::new(Vec3::ZERO, zone_id),
+                StatusEffects::default(),
+                Team::default_monster(),
+                HealthPoints::new(100),
+                Npc::new(npc_id, 0),
+                Cooldowns::default(),
+            ))
+            .id();
+
+        advance_time(&mut app, Duration::from_millis(50));
+        app.update();
+
+        let command = app
+            .world
+            .get::<Command>(caster_entity)
+            .expect("expected current command after cast chase starts");
+        let move_mode = app
+            .world
+            .get::<MoveMode>(caster_entity)
+            .expect("expected move mode after cast chase starts");
+        let move_speed = app
+            .world
+            .get::<MoveSpeed>(caster_entity)
+            .expect("expected move speed after cast chase starts");
+
+        assert!(matches!(
+            command.command,
+            CommandData::Move {
+                target: Some(target),
+                move_mode: Some(MoveMode::Run),
+                ..
+            } if target == target_entity
+        ));
+        assert_eq!(*move_mode, MoveMode::Run);
+        assert_eq!(move_speed.speed, run_speed);
+    }
+
+    #[test]
+    fn npc_restore_skill_from_chase_resumes_attack_after_cast() {
+        let game_data = load_test_game_data();
+        let npc_data = game_data
+            .npcs
+            .iter()
+            .find(|npc| npc.attack_range > 0)
+            .expect("expected at least one attack-capable npc in test data");
+        let npc_id = npc_data.id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+        let ability_values = game_data
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+        let target_ability_values = ability_values.clone();
+        let attack_range = ability_values.get_attack_range().max(100) as f32;
+        let far_target_position = Vec3::new(attack_range * 2.0 + 500.0, 0.0, 0.0);
+        let near_target_position = Vec3::new(attack_range / 2.0, 0.0, 0.0);
+        let skill_id = rose_data::SkillId::new(2983).expect("expected restore-mode npc skill");
+        let cast_motion_id = rose_data::MotionId::new(8);
+        let action_motion_id = rose_data::MotionId::new(9);
+
+        let mut app = App::new();
+        app.insert_resource(Time::default());
+        app.insert_resource(ServerMessages::default());
+        app.insert_resource(ZoneList::new());
+        app.insert_resource(game_data);
+        app.add_event::<DamageEvent>();
+        app.add_event::<SkillEvent>();
+        app.add_event::<PickupItemEvent>();
+        app.add_event::<ItemLifeEvent>();
+        app.add_event::<UseAmmoEvent>();
+        app.add_systems(Update, command_system);
+
+        let target_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Character, ClientEntityId(2), zone_id),
+                target_ability_values,
+                HealthPoints::new(100),
+                Position::new(far_target_position, zone_id),
+                Team::default_character(),
+            ))
+            .id();
+
+        let caster_entity = app
+            .world
+            .spawn((
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                ClientEntitySector::new(UVec2::ZERO),
+                Command::with_move(
+                    far_target_position,
+                    Some(target_entity),
+                    Some(MoveMode::Run),
+                ),
+                NextCommand::with_npc_cast_skill_target(
+                    skill_id,
+                    target_entity,
+                    cast_motion_id,
+                    action_motion_id,
+                    Some(CommandData::Attack {
+                        target: target_entity,
+                    }),
+                ),
+                ability_values,
+                MotionData::from_npc(&app.world.resource::<GameData>().npcs, npc_id),
+                MoveMode::Run,
+                Position::new(Vec3::ZERO, zone_id),
+                StatusEffects::default(),
+                Team::default_monster(),
+                HealthPoints::new(100),
+                Npc::new(npc_id, 0),
+                Cooldowns::default(),
+            ))
+            .id();
+
+        advance_time(&mut app, Duration::from_millis(50));
+        app.update();
+
+        app.world
+            .entity_mut(target_entity)
+            .insert(Position::new(near_target_position, zone_id));
+        app.world
+            .entity_mut(caster_entity)
+            .insert(Position::new(Vec3::ZERO, zone_id));
+
+        advance_time(&mut app, Duration::from_millis(50));
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(caster_entity)
+            .expect("expected caster next command after cast starts");
+        let current_command = app
+            .world
+            .get::<Command>(caster_entity)
+            .expect("expected current command after cast starts");
+        assert!(
+            matches!(
+                next_command.command,
+                Some(CommandData::Attack { target }) if target == target_entity
+            ),
+            "expected attack followup, got next={:?} current={:?}",
+            next_command.command,
+            current_command.command
+        );
+
+        {
+            let mut entity = app.world.entity_mut(caster_entity);
+            let mut command = entity
+                .get_mut::<Command>()
+                .expect("expected cast skill command after second update");
+            command.duration = command.required_duration.unwrap_or(Duration::ZERO);
+        }
+
+        advance_time(&mut app, Duration::from_millis(50));
+        app.update();
+
+        let command = app
+            .world
+            .get::<Command>(caster_entity)
+            .expect("expected command after cast completes");
+        let next_command = app
+            .world
+            .get::<NextCommand>(caster_entity)
+            .expect("expected next command after cast completes");
+        assert!(
+            matches!(
+                command.command,
+                CommandData::Attack { target } if target == target_entity
+            ),
+            "expected current attack command, got current={:?} next={:?}",
+            command.command,
+            next_command.command
+        );
+    }
+
+    fn load_test_game_data() -> GameData {
+        let assets_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let vfs = VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(assets_root))]);
+        let string_database = get_string_database(&vfs, 1).expect("failed to load string database");
+        let item_database = Arc::new(
+            get_item_database(&vfs, string_database.clone()).expect("failed to load item database"),
+        );
+        let npc_database = Arc::new(
+            get_npc_database(
+                &vfs,
+                string_database.clone(),
+                &NpcDatabaseOptions {
+                    load_frame_data: true,
+                },
+            )
+            .expect("failed to load npc database"),
+        );
+        let job_class_database = Arc::new(
+            get_job_class_database(&vfs, string_database.clone())
+                .expect("failed to load job class database"),
+        );
+        let skill_database = Arc::new(
+            get_skill_database(&vfs, string_database.clone())
+                .expect("failed to load skill database"),
+        );
+        let zone_database = Arc::new(
+            get_zone_database(&vfs, string_database.clone()).expect("failed to load zone database"),
+        );
+        let drop_table = get_drop_table(&vfs, item_database.clone(), npc_database.clone())
+            .expect("failed to load drop table");
+
+        GameData {
+            character_creator: Box::new(DummyCharacterCreator),
+            ability_value_calculator: get_ability_value_calculator(
+                item_database.clone(),
+                skill_database.clone(),
+                npc_database.clone(),
+            ),
+            data_decoder: get_data_decoder(),
+            drop_table,
+            ai: Arc::new(get_ai_database(&vfs).expect("failed to load ai database")),
+            items: item_database,
+            job_class: job_class_database,
+            motions: Arc::new(
+                get_character_motion_database(
+                    &vfs,
+                    &CharacterMotionDatabaseOptions {
+                        load_frame_data: true,
+                    },
+                )
+                .expect("failed to load motion database"),
+            ),
+            npcs: npc_database,
+            products: Arc::new(
+                get_product_database(&vfs).expect("failed to load product database"),
+            ),
+            quests: Arc::new(
+                get_quest_database(&vfs, string_database.clone())
+                    .expect("failed to load quest database"),
+            ),
+            skills: skill_database,
+            status_effects: Arc::new(
+                get_status_effect_database(&vfs, string_database.clone())
+                    .expect("failed to load status effect database"),
+            ),
+            string_database,
+            warp_gates: Arc::new(
+                get_warp_gate_database(&vfs).expect("failed to load warp gate database"),
+            ),
+            zones: zone_database,
+        }
+    }
+
+    fn advance_time(app: &mut App, delta: Duration) {
+        let next_instant = app
+            .world
+            .resource::<Time>()
+            .last_update()
+            .unwrap_or_else(Instant::now)
+            + delta;
+        app.world
+            .resource_mut::<Time>()
+            .update_with_instant(next_instant);
+    }
+
+    struct DummyCharacterCreator;
+
+    impl CharacterCreator for DummyCharacterCreator {
+        fn create(
+            &self,
+            _name: String,
+            _gender: CharacterGender,
+            _birth_stone: u8,
+            _face: u8,
+            _hair: u8,
+        ) -> Result<CharacterStorage, CharacterCreatorError> {
+            unreachable!("test character creation is not used in command_system tests")
+        }
+
+        fn get_basic_stats(
+            &self,
+            _gender: CharacterGender,
+        ) -> Result<BasicStats, CharacterCreatorError> {
+            unreachable!("test basic stats are not used in command_system tests")
         }
     }
 }

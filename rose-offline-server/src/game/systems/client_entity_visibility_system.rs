@@ -5,6 +5,7 @@ use bevy::{
     },
     time::Time,
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 use rose_data::ClanMemberPosition;
 use rose_game_common::messages::server::CharacterClanMembership;
@@ -59,12 +60,14 @@ pub struct ItemDropQuery<'w> {
 
 #[derive(WorldQuery)]
 pub struct MonsterQuery<'w> {
+    ability_values: &'w AbilityValues,
     npc: &'w Npc,
     position: &'w Position,
     team: &'w Team,
     health: &'w HealthPoints,
     command: &'w Command,
     move_mode: &'w MoveMode,
+    move_speed: &'w MoveSpeed,
     status_effects: &'w StatusEffects,
 }
 
@@ -147,6 +150,44 @@ fn spawn_command_state(command: &Command, query_target: &Query<TargetQuery>) -> 
         } => SpawnCommandState::CastSkillTargetPosition,
         CommandData::Sit | CommandData::Sitting => SpawnCommandState::Sit,
         CommandData::Emote { .. } => SpawnCommandState::Emote,
+    }
+}
+
+fn send_monster_spawn_messages(
+    server_message_tx: &UnboundedSender<ServerMessage>,
+    entity_id: ClientEntityId,
+    npc: &Npc,
+    position: &Position,
+    team: &Team,
+    health: HealthPoints,
+    spawn_command_state: SpawnCommandState,
+    move_mode: MoveMode,
+    move_speed: MoveSpeed,
+    ability_values: &AbilityValues,
+    status_effects: &StatusEffects,
+) {
+    server_message_tx
+        .send(ServerMessage::SpawnEntityMonster {
+            entity_id,
+            npc: npc.clone(),
+            position: position.position,
+            team: team.clone(),
+            health,
+            spawn_command_state,
+            move_mode,
+            status_effects: status_effects.active.clone(),
+        })
+        .ok();
+
+    let base_move_speed = ability_values.get_move_speed(&move_mode);
+    if (move_speed.speed - base_move_speed).abs() > f32::EPSILON {
+        server_message_tx
+            .send(ServerMessage::UpdateSpeed {
+                entity_id,
+                run_speed: move_speed.speed as i32,
+                passive_attack_speed: ability_values.get_passive_attack_speed(),
+            })
+            .ok();
     }
 }
 
@@ -267,23 +308,19 @@ pub fn client_entity_visibility_system(
                         }
                         ClientEntityType::Monster => {
                             if let Ok(monster) = monsters_query.get(*spawn_entity) {
-                                game_client
-                                    .game_client
-                                    .server_message_tx
-                                    .send(ServerMessage::SpawnEntityMonster {
-                                        entity_id: spawn_client_entity.id,
-                                        npc: monster.npc.clone(),
-                                        position: monster.position.position,
-                                        team: monster.team.clone(),
-                                        health: *monster.health,
-                                        spawn_command_state: spawn_command_state(
-                                            monster.command,
-                                            &query_target,
-                                        ),
-                                        move_mode: *monster.move_mode,
-                                        status_effects: monster.status_effects.active.clone(),
-                                    })
-                                    .ok();
+                                send_monster_spawn_messages(
+                                    &game_client.game_client.server_message_tx,
+                                    spawn_client_entity.id,
+                                    monster.npc,
+                                    monster.position,
+                                    monster.team,
+                                    *monster.health,
+                                    spawn_command_state(monster.command, &query_target),
+                                    *monster.move_mode,
+                                    *monster.move_speed,
+                                    monster.ability_values,
+                                    monster.status_effects,
+                                );
                             }
                         }
                         ClientEntityType::Npc => {
@@ -328,4 +365,153 @@ pub fn client_entity_visibility_system(
     }
 
     client_entity_list.process_zone_leavers();
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::Vec3;
+    use rose_game_common::components::AbilityValuesAdjust;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use rose_data::{NpcId, ZoneId};
+
+    use super::send_monster_spawn_messages;
+    use crate::game::{
+        components::{
+            AbilityValues, DamageCategory, DamageType, HealthPoints, MoveMode, MoveSpeed, Npc,
+            Position, StatusEffects, Team,
+        },
+        messages::server::{ServerMessage, SpawnCommandState},
+    };
+
+    fn test_ability_values(run_speed: f32) -> AbilityValues {
+        AbilityValues {
+            is_driving: false,
+            damage_category: DamageCategory::Npc,
+            level: 1,
+            walk_speed: 250.0,
+            run_speed,
+            vehicle_move_speed: 0.0,
+            strength: 0,
+            dexterity: 0,
+            intelligence: 0,
+            concentration: 0,
+            charm: 0,
+            sense: 0,
+            max_health: 100,
+            max_mana: 50,
+            additional_health_recovery: 0,
+            additional_mana_recovery: 0,
+            attack_damage_type: DamageType::Physical,
+            attack_power: 10,
+            attack_speed: 100,
+            passive_attack_speed: 0,
+            attack_range: 150,
+            hit: 1,
+            defence: 1,
+            resistance: 1,
+            critical: 1,
+            avoid: 1,
+            vehicle_attack_power: 0,
+            vehicle_attack_range: 0,
+            vehicle_attack_speed: 0,
+            vehicle_hit: 0,
+            vehicle_defence: 0,
+            vehicle_critical: 0,
+            vehicle_avoid: 0,
+            max_damage_sources: 4,
+            drop_rate: 0,
+            max_weight: 0,
+            summon_owner_level: None,
+            summon_skill_level: None,
+            adjust: AbilityValuesAdjust {
+                additional_damage_multiplier: 0.0,
+                attack_speed: 0,
+                attack_power: 0,
+                avoid: 0,
+                critical: 0,
+                defence: 0,
+                hit: 0,
+                resistance: 0,
+                max_health: 0,
+                max_mana: 0,
+                run_speed: 0.0,
+            },
+            npc_store_buy_rate: 0,
+            npc_store_sell_rate: 0,
+            save_mana: 0,
+            passive_max_summons: 0,
+        }
+    }
+
+    #[test]
+    fn boosted_monster_spawn_also_sends_update_speed() {
+        let (server_message_tx, mut server_message_rx) = unbounded_channel();
+
+        send_monster_spawn_messages(
+            &server_message_tx,
+            rose_game_common::messages::ClientEntityId(55),
+            &Npc::new(NpcId::new(1).unwrap(), 0),
+            &Position::new(Vec3::new(100.0, 200.0, 0.0), ZoneId::new(1).unwrap()),
+            &Team::default_monster(),
+            HealthPoints::new(30),
+            SpawnCommandState::Stop,
+            MoveMode::Run,
+            MoveSpeed::new(550.0),
+            &test_ability_values(400.0),
+            &StatusEffects::default(),
+        );
+
+        let first_message = server_message_rx.try_recv().unwrap();
+        match first_message {
+            ServerMessage::SpawnEntityMonster { entity_id, .. } => {
+                assert_eq!(entity_id, rose_game_common::messages::ClientEntityId(55));
+            }
+            other => panic!("expected SpawnEntityMonster, got {:?}", other),
+        }
+
+        let second_message = server_message_rx.try_recv().unwrap();
+        match second_message {
+            ServerMessage::UpdateSpeed {
+                entity_id,
+                run_speed,
+                ..
+            } => {
+                assert_eq!(entity_id, rose_game_common::messages::ClientEntityId(55));
+                assert_eq!(run_speed, 550);
+            }
+            other => panic!("expected UpdateSpeed, got {:?}", other),
+        }
+
+        assert!(server_message_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn base_speed_monster_spawn_does_not_send_update_speed() {
+        let (server_message_tx, mut server_message_rx) = unbounded_channel();
+
+        send_monster_spawn_messages(
+            &server_message_tx,
+            rose_game_common::messages::ClientEntityId(56),
+            &Npc::new(NpcId::new(1).unwrap(), 0),
+            &Position::new(Vec3::new(100.0, 200.0, 0.0), ZoneId::new(1).unwrap()),
+            &Team::default_monster(),
+            HealthPoints::new(30),
+            SpawnCommandState::Stop,
+            MoveMode::Run,
+            MoveSpeed::new(400.0),
+            &test_ability_values(400.0),
+            &StatusEffects::default(),
+        );
+
+        let first_message = server_message_rx.try_recv().unwrap();
+        match first_message {
+            ServerMessage::SpawnEntityMonster { entity_id, .. } => {
+                assert_eq!(entity_id, rose_game_common::messages::ClientEntityId(56));
+            }
+            other => panic!("expected SpawnEntityMonster, got {:?}", other),
+        }
+
+        assert!(server_message_rx.try_recv().is_err());
+    }
 }

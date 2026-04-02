@@ -25,12 +25,13 @@ use crate::game::{
     },
     systems::{
         ability_values_changed_system, ability_values_update_character_system,
-        ability_values_update_npc_system, bank_system, bonfire_aura_system, chat_commands_system,
-        clan_system, client_entity_visibility_system, command_system, control_server_system,
-        damage_system, driving_time_system, equipment_event_system, experience_points_system,
-        expire_time_system, game_server_authentication_system, game_server_join_system,
-        game_server_main_system, item_life_system, login_server_authentication_system,
-        login_server_system, monster_spawn_system, npc_ai_system, npc_store_system,
+        ability_values_update_npc_system, apply_summon_follow_speed_system, bank_system,
+        bonfire_aura_system, chat_commands_system, clan_system, client_entity_visibility_system,
+        command_system, control_server_system, damage_system, driving_time_system,
+        equipment_event_system, experience_points_system, expire_time_system,
+        game_server_authentication_system, game_server_join_system, game_server_main_system,
+        item_life_system, login_server_authentication_system, login_server_system,
+        monster_spawn_system, move_speed_sync_system, npc_ai_system, npc_store_system,
         party_member_event_system, party_member_update_info_system, party_system,
         party_update_average_level_system, passive_recovery_system, personal_store_system,
         pickup_item_system, quest_system, revive_event_system, reward_item_system, save_system,
@@ -185,6 +186,12 @@ impl GameWorld {
                 ability_values_update_character_system.before(ability_values_changed_system),
                 ability_values_update_npc_system.before(ability_values_changed_system),
                 ability_values_changed_system,
+                move_speed_sync_system
+                    .after(ability_values_changed_system)
+                    .before(server_messages_system),
+                apply_summon_follow_speed_system
+                    .after(ability_values_changed_system)
+                    .before(server_messages_system),
                 passive_recovery_system,
                 summon_points_sync_system.before(server_messages_system),
                 server_messages_system,

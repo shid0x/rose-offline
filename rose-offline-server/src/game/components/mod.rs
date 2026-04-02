@@ -32,6 +32,7 @@ mod personal_store;
 mod position;
 mod server_info;
 mod spawn_origin;
+mod summon_follow_speed_override;
 mod summon_point_cost;
 mod summon_usage;
 mod weight;
@@ -83,6 +84,7 @@ pub use personal_store::{PersonalStore, PersonalStoreSellItem, PERSONAL_STORE_IT
 pub use position::Position;
 pub use server_info::ServerInfo;
 pub use spawn_origin::SpawnOrigin;
+pub use summon_follow_speed_override::SummonFollowSpeedOverride;
 pub use summon_point_cost::SummonPointCost;
 pub use summon_usage::SummonUsage;
 pub use weight::Weight;

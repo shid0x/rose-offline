@@ -55,6 +55,7 @@ pub struct NpcQuery<'w> {
     client_entity: &'w ClientEntity,
     client_entity_sector: &'w ClientEntitySector,
     command: &'w Command,
+    next_command: &'w NextCommand,
     position: &'w Position,
     level: &'w Level,
     team: &'w Team,
@@ -555,6 +556,10 @@ fn ai_condition_has_status_effect(
     }
 }
 
+fn should_skip_npc_ai(command: &Command, status_effects: &StatusEffects) -> bool {
+    !command.is_dead() && status_effects.is_action_disabled()
+}
+
 fn get_aip_ability_value(
     ability_values: &AbilityValues,
     health_points: &HealthPoints,
@@ -824,6 +829,36 @@ fn queue_next_command(commands: &mut Commands, entity: Entity, next_command: Nex
             entity_mut.insert(next_command);
         }
     });
+}
+
+fn get_attack_move_target_entity(command: &Command, next_command: &NextCommand) -> Option<Entity> {
+    match (&command.command, &next_command.command) {
+        (
+            CommandData::Move {
+                target: Some(move_target),
+                ..
+            },
+            Some(CommandData::Attack {
+                target: next_target,
+            }),
+        ) if move_target == next_target => Some(*move_target),
+        _ => None,
+    }
+}
+
+fn get_skill_restore_command(command: &Command, next_command: &NextCommand) -> Option<CommandData> {
+    if let CommandData::Attack { target } = command.command {
+        return Some(CommandData::Attack { target });
+    }
+
+    if let Some(target) = get_attack_move_target_entity(command, next_command) {
+        return Some(CommandData::Attack { target });
+    }
+
+    match &command.command {
+        CommandData::Die { .. } | CommandData::CastSkill { .. } => None,
+        command => Some(command.clone()),
+    }
 }
 
 fn ai_action_stop(ai_system_parameters: &mut AiSystemParameters, ai_parameters: &mut AiParameters) {
@@ -1247,6 +1282,10 @@ fn ai_action_use_skill(
     skill_id: AipSkillId,
     motion_id: AipMotionId,
 ) {
+    if ai_parameters.source.status_effects.is_skill_use_disabled() {
+        return;
+    }
+
     let target_entity = match target {
         AipSkillTarget::FindChar => ai_parameters.find_char.map(|(entity, _)| entity),
         AipSkillTarget::Target => ai_parameters.source.command.target_entity(),
@@ -1256,6 +1295,10 @@ fn ai_action_use_skill(
     let skill_id = SkillId::new(skill_id as u16);
     let cast_motion_id = MotionId::new(motion_id as u16);
     let action_motion_id = MotionId::new(motion_id as u16 + 1);
+    let restore_command = get_skill_restore_command(
+        ai_parameters.source.command,
+        ai_parameters.source.next_command,
+    );
 
     if let (Some(skill_id), Some(target_entity)) = (skill_id, target_entity) {
         let next_command = if target_entity != ai_parameters.source.entity {
@@ -1264,9 +1307,15 @@ fn ai_action_use_skill(
                 target_entity,
                 cast_motion_id,
                 action_motion_id,
+                restore_command,
             )
         } else {
-            NextCommand::with_npc_cast_skill_self(skill_id, cast_motion_id, action_motion_id)
+            NextCommand::with_npc_cast_skill_self(
+                skill_id,
+                cast_motion_id,
+                action_motion_id,
+                restore_command,
+            )
         };
 
         queue_next_command(
@@ -1379,44 +1428,54 @@ fn ai_action_message(
     message_type: AipMessageType,
     string_id: usize,
 ) {
-    let npc_name = ai_system_resources
-        .game_data
-        .npcs
-        .get_npc(ai_parameters.source.npc.id)
-        .map(|npc_data| npc_data.name.to_string());
-
     if let Some(message) = ai_system_resources.game_data.ai.get_ai_string(string_id) {
-        match message_type {
-            AipMessageType::Say => ai_system_parameters.server_messages.send_entity_message(
-                ai_parameters.source.client_entity,
-                ServerMessage::LocalChat {
-                    entity_id: ai_parameters.source.client_entity.id,
-                    text: message.to_string(),
-                },
-            ),
-            AipMessageType::Shout => {
-                if let Some(npc_name) = npc_name {
-                    ai_system_parameters.server_messages.send_entity_message(
-                        ai_parameters.source.client_entity,
-                        ServerMessage::ShoutChat {
-                            name: npc_name,
-                            text: message.to_string(),
-                        },
-                    )
-                }
-            }
-            AipMessageType::Announce => {
-                if let Some(npc_name) = npc_name {
-                    ai_system_parameters.server_messages.send_entity_message(
-                        ai_parameters.source.client_entity,
-                        ServerMessage::AnnounceChat {
-                            name: Some(npc_name),
-                            text: message.to_string(),
-                        },
-                    )
-                }
-            }
-        }
+        queue_npc_ai_message(
+            &mut ai_system_parameters.server_messages,
+            ai_parameters.source.client_entity,
+            ai_system_resources
+                .game_data
+                .npcs
+                .get_npc(ai_parameters.source.npc.id)
+                .map(|npc_data| npc_data.name.as_ref()),
+            message_type,
+            message,
+        );
+    }
+}
+
+fn build_npc_ai_server_message(
+    client_entity: &ClientEntity,
+    npc_name: Option<&str>,
+    message_type: AipMessageType,
+    message: &str,
+) -> Option<ServerMessage> {
+    match message_type {
+        AipMessageType::Say => Some(ServerMessage::LocalChat {
+            entity_id: client_entity.id,
+            text: message.to_string(),
+        }),
+        AipMessageType::Shout => npc_name.map(|npc_name| ServerMessage::ShoutChat {
+            name: npc_name.to_string(),
+            text: message.to_string(),
+        }),
+        AipMessageType::Announce => npc_name.map(|npc_name| ServerMessage::AnnounceChat {
+            name: Some(npc_name.to_string()),
+            text: message.to_string(),
+        }),
+    }
+}
+
+fn queue_npc_ai_message(
+    server_messages: &mut ServerMessages,
+    client_entity: &ClientEntity,
+    npc_name: Option<&str>,
+    message_type: AipMessageType,
+    message: &str,
+) {
+    if let Some(message) =
+        build_npc_ai_server_message(client_entity, npc_name, message_type, message)
+    {
+        server_messages.send_entity_message(client_entity, message);
     }
 }
 
@@ -1590,7 +1649,13 @@ fn npc_ai_do_actions(
                 message_type,
                 string_id,
             ),
-            AipAction::Say(_) => {}        // This is client side only
+            AipAction::Say(string_id) => ai_action_message(
+                ai_system_parameters,
+                ai_system_resources,
+                ai_parameters,
+                AipMessageType::Say,
+                string_id,
+            ),
             AipAction::SpecialAttack => {} // This is not actually used, probably an old removed feature
             AipAction::DropRandomItem(ref items_base1000) => ai_action_drop_random_item(
                 ai_system_parameters,
@@ -1685,6 +1750,11 @@ pub fn npc_ai_system(
             source.ai.has_run_created_trigger = true;
         }
 
+        if should_skip_npc_ai(source.command, source.status_effects) {
+            source.ai.pending_damage.clear();
+            continue;
+        }
+
         if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
             if let Some(trigger_on_damaged) = ai_program.trigger_on_damaged.as_ref() {
                 let mut rng = rand::thread_rng();
@@ -1710,6 +1780,24 @@ pub fn npc_ai_system(
             }
         }
         source.ai.pending_damage.clear();
+
+        if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
+            if get_attack_move_target_entity(source.command, source.next_command).is_some() {
+                if let Some(trigger_on_attack_move) = ai_program.trigger_on_attack_move.as_ref() {
+                    // Match original ROSE server behavior, which runs AI_WhenAttackMOVE
+                    // while a monster is chasing a target to resume attacking.
+                    npc_ai_run_trigger(
+                        &mut ai_system_parameters,
+                        &ai_system_resources,
+                        trigger_on_attack_move,
+                        &source,
+                        None,
+                        None,
+                        false,
+                    );
+                }
+            }
+        }
 
         match source.command.command {
             CommandData::Stop { .. } => {
@@ -2110,13 +2198,48 @@ pub fn npc_ai_system(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+
+    use bevy::{
+        app::Update,
+        math::{UVec2, Vec3},
+        prelude::App,
+        time::Time,
+    };
+    use rose_data::AiDatabase;
+    use rose_data::ZoneId;
+    use rose_data::{CharacterMotionDatabaseOptions, NpcDatabaseOptions};
+    use rose_data::{StatusEffectId, StatusEffectType};
+    use rose_data_irose::{
+        get_ai_database, get_character_motion_database, get_data_decoder, get_item_database,
+        get_job_class_database, get_npc_database, get_product_database, get_quest_database,
+        get_skill_database, get_status_effect_database, get_string_database,
+        get_warp_gate_database, get_zone_database,
+    };
+    use rose_file_readers::{AipAction, AipEvent, AipFile, AipMessageType, AipTrigger};
+    use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
+    use rose_game_common::components::ActiveStatusEffect;
+    use rose_game_common::components::{BasicStats, CharacterGender};
+    use rose_game_common::messages::{server::ServerMessage, ClientEntityId};
+    use rose_game_irose::data::{get_ability_value_calculator, get_drop_table};
+
     use bevy::ecs::{
         prelude::World,
         system::{CommandQueue, Commands},
     };
 
-    use super::queue_next_command;
-    use crate::game::components::NextCommand;
+    use super::{
+        build_npc_ai_server_message, get_attack_move_target_entity, get_skill_restore_command,
+        npc_ai_system, queue_next_command, queue_npc_ai_message, should_skip_npc_ai,
+    };
+    use crate::game::{
+        components::{
+            ClientEntity, ClientEntityType, Command, CommandData, NextCommand, StatusEffects,
+        },
+        resources::{ClientEntityList, ServerMessages, WorldRates, WorldTime, ZoneList},
+        storage::character::{CharacterCreator, CharacterCreatorError, CharacterStorage},
+        GameData,
+    };
 
     #[test]
     fn queued_next_command_skips_entities_despawned_earlier_in_the_same_flush() {
@@ -2133,5 +2256,358 @@ mod tests {
         queue.apply(&mut world);
 
         assert!(world.get_entity(entity).is_none());
+    }
+
+    #[test]
+    fn npc_ai_skips_non_dead_entities_while_action_disabled() {
+        let mut status_effects = StatusEffects::default();
+        status_effects.active[StatusEffectType::Sleep] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(1).unwrap(),
+            value: 1,
+        });
+
+        assert!(should_skip_npc_ai(&Command::with_stop(), &status_effects));
+        assert!(!should_skip_npc_ai(
+            &Command::with_die(None, None, None),
+            &status_effects
+        ));
+    }
+
+    #[test]
+    fn npc_ai_skill_disable_does_not_count_as_action_disable() {
+        let mut status_effects = StatusEffects::default();
+        status_effects.active[StatusEffectType::Dumb] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(2).unwrap(),
+            value: 1,
+        });
+
+        assert!(!should_skip_npc_ai(&Command::with_stop(), &status_effects));
+        assert!(status_effects.is_skill_use_disabled());
+    }
+
+    #[test]
+    fn npc_ai_legacy_say_enqueues_local_chat() {
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(123),
+            ZoneId::new(1).unwrap(),
+        );
+        let mut server_messages = ServerMessages::default();
+
+        queue_npc_ai_message(
+            &mut server_messages,
+            &client_entity,
+            Some("Jelly Bean"),
+            AipMessageType::Say,
+            "Boing",
+        );
+
+        assert_eq!(server_messages.pending_entity_messages.len(), 1);
+        let entity_message = &server_messages.pending_entity_messages[0];
+        assert_eq!(entity_message.zone_id, client_entity.zone_id);
+        assert_eq!(entity_message.entity_id, client_entity.id);
+
+        match &entity_message.message {
+            ServerMessage::LocalChat { entity_id, text } => {
+                assert_eq!(*entity_id, client_entity.id);
+                assert_eq!(text, "Boing");
+            }
+            message => panic!("expected LocalChat, got {:?}", message),
+        }
+    }
+
+    #[test]
+    fn npc_ai_message_say_builds_same_local_chat_as_legacy_say() {
+        let client_entity = ClientEntity::new(
+            ClientEntityType::Monster,
+            ClientEntityId(321),
+            ZoneId::new(2).unwrap(),
+        );
+
+        let legacy_say =
+            build_npc_ai_server_message(&client_entity, Some("Stony"), AipMessageType::Say, "Grr");
+        let message_say =
+            build_npc_ai_server_message(&client_entity, Some("Stony"), AipMessageType::Say, "Grr");
+
+        match (legacy_say, message_say) {
+            (
+                Some(ServerMessage::LocalChat {
+                    entity_id: legacy_entity_id,
+                    text: legacy_text,
+                }),
+                Some(ServerMessage::LocalChat {
+                    entity_id: message_entity_id,
+                    text: message_text,
+                }),
+            ) => {
+                assert_eq!(legacy_entity_id, message_entity_id);
+                assert_eq!(legacy_text, message_text);
+            }
+            (legacy_message, message_say) => panic!(
+                "expected matching LocalChat messages, got {:?} and {:?}",
+                legacy_message, message_say
+            ),
+        }
+    }
+
+    #[test]
+    fn attack_move_target_entity_detects_chase_to_attack_state() {
+        let target_entity = World::new().spawn_empty().id();
+        let command = Command::with_move(Vec3::new(100.0, 200.0, 0.0), Some(target_entity), None);
+        let next_command = NextCommand::with_attack(target_entity);
+
+        assert_eq!(
+            get_attack_move_target_entity(&command, &next_command),
+            Some(target_entity)
+        );
+    }
+
+    #[test]
+    fn attack_move_target_entity_rejects_generic_move_without_attack_followup() {
+        let target_entity = World::new().spawn_empty().id();
+        let command = Command::with_move(Vec3::new(100.0, 200.0, 0.0), Some(target_entity), None);
+        let next_command = NextCommand::with_stop(false);
+
+        assert_eq!(get_attack_move_target_entity(&command, &next_command), None);
+    }
+
+    #[test]
+    fn attack_move_target_entity_rejects_mismatched_followup_target() {
+        let mut world = World::new();
+        let move_target = world.spawn_empty().id();
+        let attack_target = world.spawn_empty().id();
+        let command = Command::with_move(Vec3::new(100.0, 200.0, 0.0), Some(move_target), None);
+        let next_command = NextCommand::with_attack(attack_target);
+
+        assert_eq!(get_attack_move_target_entity(&command, &next_command), None);
+    }
+
+    #[test]
+    fn skill_restore_command_preserves_current_attack_target() {
+        let target_entity = World::new().spawn_empty().id();
+        let command = Command::with_attack(target_entity, Duration::from_secs(1));
+        let next_command = NextCommand::default();
+
+        assert!(matches!(
+            get_skill_restore_command(&command, &next_command),
+            Some(CommandData::Attack { target }) if target == target_entity
+        ));
+    }
+
+    #[test]
+    fn skill_restore_command_turns_chase_back_into_attack() {
+        let target_entity = World::new().spawn_empty().id();
+        let command = Command::with_move(Vec3::new(100.0, 200.0, 0.0), Some(target_entity), None);
+        let next_command = NextCommand::with_attack(target_entity);
+
+        assert!(matches!(
+            get_skill_restore_command(&command, &next_command),
+            Some(CommandData::Attack { target }) if target == target_entity
+        ));
+    }
+
+    #[test]
+    fn skill_restore_command_keeps_non_combat_move_as_is() {
+        let target_entity = World::new().spawn_empty().id();
+        let command = Command::with_move(Vec3::new(100.0, 200.0, 0.0), Some(target_entity), None);
+        let next_command = NextCommand::with_stop(false);
+
+        assert!(matches!(
+            get_skill_restore_command(&command, &next_command),
+            Some(CommandData::Move {
+                target: Some(target),
+                ..
+            }) if target == target_entity
+        ));
+    }
+
+    #[test]
+    fn npc_ai_runs_attack_move_trigger_during_chase() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data");
+        let npc_id = npc_id.id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: std::time::Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 0,
+                    trigger_on_created: None,
+                    trigger_on_idle: None,
+                    trigger_on_attack_move: Some(AipTrigger {
+                        name: String::from("attack_move"),
+                        events: vec![AipEvent {
+                            name: String::from("stop"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::Stop],
+                        }],
+                    }),
+                    trigger_on_damaged: None,
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = App::new();
+        app.insert_resource(Time::default());
+        app.insert_resource(WorldTime::new());
+        app.insert_resource(ServerMessages::default());
+        app.insert_resource(WorldRates::new());
+        app.insert_resource(ZoneList::new());
+        app.insert_resource(ClientEntityList::new(&game_data.zones));
+        app.insert_resource(game_data);
+        app.add_event::<crate::game::events::DamageEvent>();
+        app.add_event::<crate::game::events::QuestTriggerEvent>();
+        app.add_event::<crate::game::events::RewardItemEvent>();
+        app.add_event::<crate::game::events::RewardXpEvent>();
+        app.add_systems(Update, npc_ai_system);
+
+        let target_entity = app.world.spawn_empty().id();
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_move(Vec3::new(10.0, 0.0, 0.0), Some(target_entity), None),
+                NextCommand::with_attack(target_entity),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                StatusEffects::default(),
+            ))
+            .id();
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(crate::game::components::CommandData::Stop { send_message: true })
+        ));
+    }
+
+    fn load_test_game_data() -> GameData {
+        let assets_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let vfs = VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(assets_root))]);
+        let string_database = get_string_database(&vfs, 1).expect("failed to load string database");
+        let item_database = Arc::new(
+            get_item_database(&vfs, string_database.clone()).expect("failed to load item database"),
+        );
+        let npc_database = Arc::new(
+            get_npc_database(
+                &vfs,
+                string_database.clone(),
+                &NpcDatabaseOptions {
+                    load_frame_data: true,
+                },
+            )
+            .expect("failed to load npc database"),
+        );
+        let job_class_database = Arc::new(
+            get_job_class_database(&vfs, string_database.clone())
+                .expect("failed to load job class database"),
+        );
+        let skill_database = Arc::new(
+            get_skill_database(&vfs, string_database.clone())
+                .expect("failed to load skill database"),
+        );
+        let zone_database = Arc::new(
+            get_zone_database(&vfs, string_database.clone()).expect("failed to load zone database"),
+        );
+        let drop_table = get_drop_table(&vfs, item_database.clone(), npc_database.clone())
+            .expect("failed to load drop table");
+
+        GameData {
+            character_creator: Box::new(DummyCharacterCreator),
+            ability_value_calculator: get_ability_value_calculator(
+                item_database.clone(),
+                skill_database.clone(),
+                npc_database.clone(),
+            ),
+            data_decoder: get_data_decoder(),
+            drop_table,
+            ai: Arc::new(get_ai_database(&vfs).expect("failed to load ai database")),
+            items: item_database,
+            job_class: job_class_database,
+            motions: Arc::new(
+                get_character_motion_database(
+                    &vfs,
+                    &CharacterMotionDatabaseOptions {
+                        load_frame_data: true,
+                    },
+                )
+                .expect("failed to load motion database"),
+            ),
+            npcs: npc_database,
+            products: Arc::new(
+                get_product_database(&vfs).expect("failed to load product database"),
+            ),
+            quests: Arc::new(
+                get_quest_database(&vfs, string_database.clone())
+                    .expect("failed to load quest database"),
+            ),
+            skills: skill_database,
+            status_effects: Arc::new(
+                get_status_effect_database(&vfs, string_database.clone())
+                    .expect("failed to load status effect database"),
+            ),
+            string_database,
+            warp_gates: Arc::new(
+                get_warp_gate_database(&vfs).expect("failed to load warp gate database"),
+            ),
+            zones: zone_database,
+        }
+    }
+
+    struct DummyCharacterCreator;
+
+    impl CharacterCreator for DummyCharacterCreator {
+        fn create(
+            &self,
+            _name: String,
+            _gender: CharacterGender,
+            _birth_stone: u8,
+            _face: u8,
+            _hair: u8,
+        ) -> Result<CharacterStorage, CharacterCreatorError> {
+            unreachable!("test character creation is not used in npc_ai_system tests")
+        }
+
+        fn get_basic_stats(
+            &self,
+            _gender: CharacterGender,
+        ) -> Result<BasicStats, CharacterCreatorError> {
+            Ok(BasicStats::default())
+        }
     }
 }

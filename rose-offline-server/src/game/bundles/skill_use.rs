@@ -10,7 +10,7 @@ use crate::game::{
     components::{
         AbilityValues, ClanMembership, ClientEntity, ClientEntityType, Cooldowns, Equipment,
         ExperiencePoints, HealthPoints, Inventory, ManaPoints, MoveMode, PartyMembership, Position,
-        Stamina, SummonUsage, Team,
+        Stamina, StatusEffects, SummonUsage, Team,
     },
     pvp::can_character_attack_character,
     resources::ZoneList,
@@ -28,6 +28,7 @@ pub struct SkillCasterBundle<'w> {
     pub health_points: &'w HealthPoints,
     pub move_mode: &'w MoveMode,
     pub position: &'w Position,
+    pub status_effects: &'w StatusEffects,
     pub team: &'w Team,
 
     pub clan_membership: Option<&'w ClanMembership>,
@@ -93,9 +94,8 @@ fn check_skill_cooldown(
     true
 }
 
-fn check_not_disabled(_skill_caster: &SkillCasterBundleItem) -> bool {
-    // TODO: Check not muted / sleep / fainted / stunned
-    true
+fn check_skill_use_not_disabled(status_effects: &StatusEffects) -> bool {
+    !status_effects.is_skill_use_disabled()
 }
 
 fn check_weight(_skill_caster: &SkillCasterBundleItem) -> bool {
@@ -394,16 +394,16 @@ pub fn skill_can_use(
     skill_caster: &SkillCasterBundleItem,
     skill_data: &SkillData,
 ) -> bool {
+    if !check_skill_use_not_disabled(skill_caster.status_effects) {
+        return false;
+    }
+
     if !skill_caster.client_entity.is_character() {
         // We only check use requirements for characters
         return true;
     }
 
     if !check_skill_cooldown(skill_caster, now, skill_data) {
-        return false;
-    }
-
-    if !check_not_disabled(skill_caster) {
         return false;
     }
 
@@ -533,4 +533,47 @@ pub fn skill_use_ability_value(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use rose_data::{StatusEffectId, StatusEffectType};
+
+    use super::check_skill_use_not_disabled;
+    use crate::game::components::{ActiveStatusEffect, StatusEffects};
+
+    #[test]
+    fn disabled_skill_use_rejects_dumb_sleep_and_fainting() {
+        let mut dumb = StatusEffects::default();
+        dumb.active[StatusEffectType::Dumb] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(1).unwrap(),
+            value: 1,
+        });
+        assert!(!check_skill_use_not_disabled(&dumb));
+
+        let mut sleep = StatusEffects::default();
+        sleep.active[StatusEffectType::Sleep] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(2).unwrap(),
+            value: 1,
+        });
+        assert!(!check_skill_use_not_disabled(&sleep));
+
+        let mut fainting = StatusEffects::default();
+        fainting.active[StatusEffectType::Fainting] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(3).unwrap(),
+            value: 1,
+        });
+        assert!(!check_skill_use_not_disabled(&fainting));
+    }
+
+    #[test]
+    fn skill_use_allows_non_disabling_status_effects() {
+        let mut status_effects = StatusEffects::default();
+        status_effects.active[StatusEffectType::Poisoned] = Some(ActiveStatusEffect {
+            id: StatusEffectId::new(4).unwrap(),
+            value: 1,
+        });
+
+        assert!(check_skill_use_not_disabled(&status_effects));
+    }
 }

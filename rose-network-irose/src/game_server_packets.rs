@@ -2079,13 +2079,7 @@ impl From<&PacketServerUpdateAmmo> for Packet {
         for b in part.into_bytes().iter() {
             writer.write_u8(*b);
         }
-        writer.write_u32(
-            packet
-                .item
-                .as_ref()
-                .map(|item| item.quantity)
-                .unwrap_or(0),
-        );
+        writer.write_u32(packet.item.as_ref().map(|item| item.quantity).unwrap_or(0));
 
         writer.into()
     }
