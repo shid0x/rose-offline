@@ -45,6 +45,7 @@ use crate::game::{
 };
 
 const DAMAGE_REWARD_EXPIRE_TIME: Duration = Duration::from_secs(5 * 60);
+const RECENT_DAMAGE_AGGRO_TIME: Duration = Duration::from_secs(5);
 
 #[derive(WorldQuery)]
 #[world_query(mutable)]
@@ -137,6 +138,15 @@ struct AiParameters<'a, '__w, 'w, '__wa, 'wa> {
     damage_received: Option<Damage>,
     selected_local_npc: Option<Entity>,
     is_dead: bool,
+    queued_next_command: bool,
+    queued_non_combat_move: bool,
+}
+
+#[derive(Default)]
+struct AiTriggerOutcome {
+    matched_event: bool,
+    queued_next_command: bool,
+    queued_non_combat_move: bool,
 }
 
 enum AiConditionResult {
@@ -831,6 +841,23 @@ fn queue_next_command(commands: &mut Commands, entity: Entity, next_command: Nex
     });
 }
 
+fn queue_source_next_command(
+    ai_system_parameters: &mut AiSystemParameters,
+    ai_parameters: &mut AiParameters,
+    next_command: NextCommand,
+) {
+    ai_parameters.queued_next_command = true;
+    ai_parameters.queued_non_combat_move |= matches!(
+        next_command.command.as_ref(),
+        Some(CommandData::Move { target: None, .. })
+    );
+    queue_next_command(
+        &mut ai_system_parameters.commands,
+        ai_parameters.source.entity,
+        next_command,
+    );
+}
+
 fn get_attack_move_target_entity(command: &Command, next_command: &NextCommand) -> Option<Entity> {
     match (&command.command, &next_command.command) {
         (
@@ -861,10 +888,79 @@ fn get_skill_restore_command(command: &Command, next_command: &NextCommand) -> O
     }
 }
 
+fn find_recent_damage_attacker(
+    source: &NpcQueryItem,
+    attacker_query: &Query<AttackerQuery>,
+    now: std::time::Instant,
+) -> Option<Entity> {
+    let damage_sources = source.damage_sources?;
+
+    damage_sources
+        .damage_sources
+        .iter()
+        .filter(|damage_source| now - damage_source.last_damage_time <= RECENT_DAMAGE_AGGRO_TIME)
+        .filter_map(|damage_source| {
+            let attacker = attacker_query.get(damage_source.entity).ok()?;
+            if attacker.position.zone_id != source.position.zone_id
+                || attacker.health_points.hp <= 0
+                || attacker.team.id == source.team.id
+            {
+                return None;
+            }
+
+            Some((
+                damage_source.total_damage,
+                damage_source.last_damage_time,
+                attacker.entity,
+            ))
+        })
+        .max_by(
+            |(total_damage_a, last_damage_time_a, _), (total_damage_b, last_damage_time_b, _)| {
+                total_damage_a
+                    .cmp(total_damage_b)
+                    .then(last_damage_time_a.cmp(last_damage_time_b))
+            },
+        )
+        .map(|(_, _, entity)| entity)
+}
+
+fn has_recent_damage_from_entity(
+    source: &NpcQueryItem,
+    entity: Entity,
+    now: std::time::Instant,
+) -> bool {
+    source.damage_sources.map_or(false, |damage_sources| {
+        damage_sources.damage_sources.iter().any(|damage_source| {
+            damage_source.entity == entity
+                && now - damage_source.last_damage_time <= RECENT_DAMAGE_AGGRO_TIME
+        })
+    })
+}
+
+fn should_override_recent_damage_followup(
+    next_command: &NextCommand,
+    aggro_target: Entity,
+) -> bool {
+    match next_command.command.as_ref() {
+        Some(CommandData::Stop { .. }) => true,
+        Some(CommandData::Move { target: None, .. }) => true,
+        Some(CommandData::Attack { target }) => *target != aggro_target,
+        Some(CommandData::Move {
+            target: Some(target),
+            ..
+        }) => *target != aggro_target,
+        Some(CommandData::CastSkill {
+            skill_target: Some(crate::game::components::CommandCastSkillTarget::Entity(target)),
+            ..
+        }) => *target != aggro_target,
+        _ => false,
+    }
+}
+
 fn ai_action_stop(ai_system_parameters: &mut AiSystemParameters, ai_parameters: &mut AiParameters) {
-    queue_next_command(
-        &mut ai_system_parameters.commands,
-        ai_parameters.source.entity,
+    queue_source_next_command(
+        ai_system_parameters,
+        ai_parameters,
         NextCommand::with_stop(true),
     );
 }
@@ -874,9 +970,9 @@ fn ai_action_attack_attacker(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some(attacker) = ai_parameters.attacker {
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
+        queue_source_next_command(
+            ai_system_parameters,
+            ai_parameters,
             NextCommand::with_attack(attacker.entity),
         );
     }
@@ -887,9 +983,9 @@ fn ai_action_attack_find_char(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some((find_char, _)) = ai_parameters.find_char {
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
+        queue_source_next_command(
+            ai_system_parameters,
+            ai_parameters,
             NextCommand::with_attack(find_char),
         );
     }
@@ -900,9 +996,9 @@ fn ai_action_attack_near_char(
     ai_parameters: &mut AiParameters,
 ) {
     if let Some((near_char, _)) = ai_parameters.near_char {
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
+        queue_source_next_command(
+            ai_system_parameters,
+            ai_parameters,
             NextCommand::with_attack(near_char),
         );
     }
@@ -927,9 +1023,9 @@ fn ai_action_move_away_from_target(
             let move_vector = distance as f32 * direction_away_from_target;
             let destination = source_position + Vec3::new(move_vector.x, move_vector.y, 0.0);
 
-            queue_next_command(
-                &mut ai_system_parameters.commands,
-                ai_parameters.source.entity,
+            queue_source_next_command(
+                ai_system_parameters,
+                ai_parameters,
                 NextCommand::with_move(destination, None, Some(move_mode)),
             );
         }
@@ -966,9 +1062,9 @@ fn ai_action_move_random_distance(
             AipMoveMode::Walk => MoveMode::Walk,
         };
         let destination = move_origin + Vec3::new(dx as f32, dy as f32, 0.0);
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
+        queue_source_next_command(
+            ai_system_parameters,
+            ai_parameters,
             NextCommand::with_move(destination, None, Some(move_mode)),
         );
     }
@@ -997,9 +1093,9 @@ fn ai_action_attack_owner_target(
                 && target.team.id != ai_parameters.source.team.id
                 && target.health_points.hp > 0
             {
-                queue_next_command(
-                    &mut ai_system_parameters.commands,
-                    ai_parameters.source.entity,
+                queue_source_next_command(
+                    ai_system_parameters,
+                    ai_parameters,
                     NextCommand::with_attack(owner_target_entity),
                 );
             }
@@ -1064,9 +1160,9 @@ fn ai_action_attack_nearby_entity_by_stat(
     };
 
     if let Some(target_entity) = target_entity {
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
+        queue_source_next_command(
+            ai_system_parameters,
+            ai_parameters,
             NextCommand::with_attack(target_entity),
         );
     }
@@ -1268,9 +1364,9 @@ fn ai_action_use_emote(
 ) {
     let motion_id = MotionId::new(motion_id as u16);
 
-    queue_next_command(
-        &mut ai_system_parameters.commands,
-        ai_parameters.source.entity,
+    queue_source_next_command(
+        ai_system_parameters,
+        ai_parameters,
         NextCommand::with_emote(motion_id, true),
     );
 }
@@ -1318,11 +1414,7 @@ fn ai_action_use_skill(
             )
         };
 
-        queue_next_command(
-            &mut ai_system_parameters.commands,
-            ai_parameters.source.entity,
-            next_command,
-        );
+        queue_source_next_command(ai_system_parameters, ai_parameters, next_command);
     }
 }
 
@@ -1688,7 +1780,7 @@ fn npc_ai_run_trigger(
     attacker: Option<AttackerQueryItem>,
     damage: Option<Damage>,
     is_dead: bool,
-) {
+) -> AiTriggerOutcome {
     let mut ai_parameters = AiParameters {
         source,
         attacker: attacker.as_ref(),
@@ -1697,7 +1789,10 @@ fn npc_ai_run_trigger(
         selected_local_npc: None,
         damage_received: damage,
         is_dead,
+        queued_next_command: false,
+        queued_non_combat_move: false,
     };
+    let mut outcome = AiTriggerOutcome::default();
 
     // Do actions for only the first event with valid conditions
     log::trace!(target: "npc_ai", "Running AI trigger");
@@ -1709,15 +1804,20 @@ fn npc_ai_run_trigger(
             ai_program_event,
             &mut ai_parameters,
         ) {
+            outcome.matched_event = true;
             npc_ai_do_actions(
                 ai_system_parameters,
                 ai_system_resources,
                 ai_program_event,
                 &mut ai_parameters,
             );
+            outcome.queued_next_command = ai_parameters.queued_next_command;
+            outcome.queued_non_combat_move = ai_parameters.queued_non_combat_move;
             break;
         }
     }
+
+    outcome
 }
 
 pub fn npc_ai_system(
@@ -1735,7 +1835,7 @@ pub fn npc_ai_system(
         if !source.ai.has_run_created_trigger {
             if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
                 if let Some(trigger_on_created) = ai_program.trigger_on_created.as_ref() {
-                    npc_ai_run_trigger(
+                    let _ = npc_ai_run_trigger(
                         &mut ai_system_parameters,
                         &ai_system_resources,
                         trigger_on_created,
@@ -1755,10 +1855,35 @@ pub fn npc_ai_system(
             continue;
         }
 
+        let mut damaged_queued_command_this_tick = false;
+        let mut damaged_by_current_target_this_tick = false;
+        let current_target_entity = source.command.target_entity();
+        let had_queued_target_before_damage = source.next_command.target_entity().is_some();
+        let mut fallback_attack_attacker = None;
+        let now = std::time::Instant::now();
+        let recent_damage_attacker = find_recent_damage_attacker(&source, &attacker_query, now);
         if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
             if let Some(trigger_on_damaged) = ai_program.trigger_on_damaged.as_ref() {
                 let mut rng = rand::thread_rng();
                 for &(attacker_entity, damage) in source.ai.pending_damage.iter() {
+                    damaged_by_current_target_this_tick |=
+                        current_target_entity == Some(attacker_entity);
+
+                    if fallback_attack_attacker.is_none() {
+                        fallback_attack_attacker = attacker_query
+                            .get(attacker_entity)
+                            .ok()
+                            .and_then(|attacker_data| {
+                                if attacker_data.team.id != source.team.id
+                                    && attacker_data.health_points.hp > 0
+                                {
+                                    Some(attacker_entity)
+                                } else {
+                                    None
+                                }
+                            });
+                    }
+
                     if source.command.target_entity().is_some()
                         && ai_program.damage_trigger_new_target_chance < rng.gen_range(0..100)
                     {
@@ -1766,7 +1891,7 @@ pub fn npc_ai_system(
                     }
 
                     if let Ok(attacker_data) = attacker_query.get(attacker_entity) {
-                        npc_ai_run_trigger(
+                        let outcome = npc_ai_run_trigger(
                             &mut ai_system_parameters,
                             &ai_system_resources,
                             trigger_on_damaged,
@@ -1775,32 +1900,91 @@ pub fn npc_ai_system(
                             Some(damage),
                             false,
                         );
+                        damaged_queued_command_this_tick |= outcome.queued_next_command;
                     }
                 }
+
+                if damaged_queued_command_this_tick {
+                    source.ai.idle_duration = Duration::default();
+                }
+            }
+        }
+
+        if current_target_entity.is_none() && !had_queued_target_before_damage {
+            if let Some(attacker_entity) = fallback_attack_attacker.or(recent_damage_attacker) {
+                queue_next_command(
+                    &mut ai_system_parameters.commands,
+                    source.entity,
+                    NextCommand::with_attack(attacker_entity),
+                );
+                damaged_queued_command_this_tick = true;
+                source.ai.idle_duration = Duration::default();
             }
         }
         source.ai.pending_damage.clear();
 
-        if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
-            if get_attack_move_target_entity(source.command, source.next_command).is_some() {
-                if let Some(trigger_on_attack_move) = ai_program.trigger_on_attack_move.as_ref() {
-                    // Match original ROSE server behavior, which runs AI_WhenAttackMOVE
-                    // while a monster is chasing a target to resume attacking.
-                    npc_ai_run_trigger(
-                        &mut ai_system_parameters,
-                        &ai_system_resources,
-                        trigger_on_attack_move,
-                        &source,
-                        None,
-                        None,
-                        false,
-                    );
+        let current_target_recently_damaged_us = current_target_entity
+            .map_or(false, |target_entity| {
+                has_recent_damage_from_entity(&source, target_entity, now)
+            });
+        let recent_aggro_target = current_target_entity
+            .filter(|target_entity| has_recent_damage_from_entity(&source, *target_entity, now))
+            .or(recent_damage_attacker);
+
+        if let Some(aggro_target) = recent_aggro_target {
+            if should_override_recent_damage_followup(source.next_command, aggro_target) {
+                queue_next_command(
+                    &mut ai_system_parameters.commands,
+                    source.entity,
+                    NextCommand::with_attack(aggro_target),
+                );
+                damaged_queued_command_this_tick = true;
+                source.ai.idle_duration = Duration::default();
+            }
+        }
+
+        if !damaged_queued_command_this_tick
+            && !damaged_by_current_target_this_tick
+            && !current_target_recently_damaged_us
+        {
+            if let Some(ai_program) = ai_system_resources.game_data.ai.get_ai(source.ai.ai_index) {
+                if let Some(attack_move_target) =
+                    get_attack_move_target_entity(source.command, source.next_command)
+                {
+                    if let Some(trigger_on_attack_move) = ai_program.trigger_on_attack_move.as_ref()
+                    {
+                        // Match original ROSE server behavior, which runs AI_WhenAttackMOVE
+                        // while a monster is chasing a target to resume attacking.
+                        let outcome = npc_ai_run_trigger(
+                            &mut ai_system_parameters,
+                            &ai_system_resources,
+                            trigger_on_attack_move,
+                            &source,
+                            None,
+                            None,
+                            false,
+                        );
+
+                        // Some chase-time AIP branches queue targetless reposition moves.
+                        // In this server model those moves can erase the chase follow-up,
+                        // so keep the existing combat target authoritative.
+                        if outcome.queued_non_combat_move {
+                            queue_next_command(
+                                &mut ai_system_parameters.commands,
+                                source.entity,
+                                NextCommand::with_attack(attack_move_target),
+                            );
+                        }
+                    }
                 }
             }
         }
 
         match source.command.command {
             CommandData::Stop { .. } => {
+                if damaged_queued_command_this_tick {
+                    continue;
+                }
                 if let Some(ai_program) =
                     ai_system_resources.game_data.ai.get_ai(source.ai.ai_index)
                 {
@@ -1808,7 +1992,7 @@ pub fn npc_ai_system(
                         source.ai.idle_duration += ai_system_resources.time.delta();
 
                         if source.ai.idle_duration > ai_program.idle_trigger_interval {
-                            npc_ai_run_trigger(
+                            let _ = npc_ai_run_trigger(
                                 &mut ai_system_parameters,
                                 &ai_system_resources,
                                 trigger_on_idle,
@@ -1850,7 +2034,7 @@ pub fn npc_ai_system(
                         let attacker_data = killer_entity
                             .and_then(|killer_entity| attacker_query.get(killer_entity).ok());
 
-                        npc_ai_run_trigger(
+                        let _ = npc_ai_run_trigger(
                             &mut ai_system_parameters,
                             &ai_system_resources,
                             trigger_on_dead,
@@ -2216,10 +2400,14 @@ mod tests {
         get_skill_database, get_status_effect_database, get_string_database,
         get_warp_gate_database, get_zone_database,
     };
-    use rose_file_readers::{AipAction, AipEvent, AipFile, AipMessageType, AipTrigger};
+    use rose_file_readers::{
+        AipAction, AipEvent, AipFile, AipMessageType, AipResultOperator, AipTrigger,
+        AipVariableType,
+    };
     use rose_file_readers::{HostFilesystemDevice, VirtualFilesystem};
     use rose_game_common::components::ActiveStatusEffect;
     use rose_game_common::components::{BasicStats, CharacterGender};
+    use rose_game_common::data::Damage;
     use rose_game_common::messages::{server::ServerMessage, ClientEntityId};
     use rose_game_irose::data::{get_ability_value_calculator, get_drop_table};
 
@@ -2234,7 +2422,8 @@ mod tests {
     };
     use crate::game::{
         components::{
-            ClientEntity, ClientEntityType, Command, CommandData, NextCommand, StatusEffects,
+            ClientEntity, ClientEntityType, Command, CommandData, DamageSource, DamageSources,
+            NextCommand, ObjectVariables, StatusEffects,
         },
         resources::{ClientEntityList, ServerMessages, WorldRates, WorldTime, ZoneList},
         storage::character::{CharacterCreator, CharacterCreatorError, CharacterStorage},
@@ -2421,6 +2610,800 @@ mod tests {
         ));
     }
 
+    fn create_test_app(game_data: GameData) -> App {
+        let mut app = App::new();
+        app.insert_resource(Time::default());
+        app.insert_resource(WorldTime::new());
+        app.insert_resource(ServerMessages::default());
+        app.insert_resource(WorldRates::new());
+        app.insert_resource(ZoneList::new());
+        app.insert_resource(ClientEntityList::new(&game_data.zones));
+        app.insert_resource(game_data);
+        app.add_event::<crate::game::events::DamageEvent>();
+        app.add_event::<crate::game::events::QuestTriggerEvent>();
+        app.add_event::<crate::game::events::RewardItemEvent>();
+        app.add_event::<crate::game::events::RewardXpEvent>();
+        app.add_systems(Update, npc_ai_system);
+        app
+    }
+
+    #[test]
+    fn npc_ai_damaged_trigger_command_beats_idle_trigger_same_tick() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 100,
+                    trigger_on_created: None,
+                    trigger_on_idle: Some(AipTrigger {
+                        name: String::from("idle"),
+                        events: vec![AipEvent {
+                            name: String::from("stop"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::Stop],
+                        }],
+                    }),
+                    trigger_on_attack_move: None,
+                    trigger_on_damaged: Some(AipTrigger {
+                        name: String::from("damaged"),
+                        events: vec![AipEvent {
+                            name: String::from("retaliate"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::AttackAttacker],
+                        }],
+                    }),
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_stop(),
+                NextCommand::default(),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                StatusEffects::default(),
+            ))
+            .id();
+
+        {
+            let mut npc_ai = app
+                .world
+                .get_mut::<crate::game::components::NpcAi>(entity)
+                .expect("expected npc ai");
+            npc_ai.idle_duration = Duration::from_secs(2);
+            npc_ai.pending_damage.push((
+                attacker_entity,
+                Damage {
+                    amount: 25,
+                    is_critical: false,
+                    apply_hit_stun: false,
+                },
+            ));
+        }
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+        let npc_ai = app
+            .world
+            .get::<crate::game::components::NpcAi>(entity)
+            .expect("expected npc ai after update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+        assert_eq!(npc_ai.idle_duration, Duration::default());
+    }
+
+    #[test]
+    fn npc_ai_damaged_trigger_without_command_falls_back_to_attack_attacker() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 100,
+                    trigger_on_created: None,
+                    trigger_on_idle: Some(AipTrigger {
+                        name: String::from("idle"),
+                        events: vec![AipEvent {
+                            name: String::from("stop"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::Stop],
+                        }],
+                    }),
+                    trigger_on_attack_move: None,
+                    trigger_on_damaged: Some(AipTrigger {
+                        name: String::from("damaged"),
+                        events: vec![AipEvent {
+                            name: String::from("set_variable"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::SetVariable(
+                                AipVariableType::Ai,
+                                0,
+                                AipResultOperator::Set,
+                                7,
+                            )],
+                        }],
+                    }),
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_stop(),
+                NextCommand::default(),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                StatusEffects::default(),
+                ObjectVariables::new(5),
+            ))
+            .id();
+
+        {
+            let mut npc_ai = app
+                .world
+                .get_mut::<crate::game::components::NpcAi>(entity)
+                .expect("expected npc ai");
+            npc_ai.idle_duration = Duration::from_secs(2);
+            npc_ai.pending_damage.push((
+                attacker_entity,
+                Damage {
+                    amount: 25,
+                    is_critical: false,
+                    apply_hit_stun: false,
+                },
+            ));
+        }
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+        let object_variables = app
+            .world
+            .get::<ObjectVariables>(entity)
+            .expect("expected object variables after update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+        assert_eq!(object_variables.variables[0], 7);
+    }
+
+    #[test]
+    fn npc_ai_damaged_trigger_command_beats_attack_move_trigger_same_tick() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 100,
+                    trigger_on_created: None,
+                    trigger_on_idle: None,
+                    trigger_on_attack_move: Some(AipTrigger {
+                        name: String::from("attack_move"),
+                        events: vec![AipEvent {
+                            name: String::from("stop"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::Stop],
+                        }],
+                    }),
+                    trigger_on_damaged: Some(AipTrigger {
+                        name: String::from("damaged"),
+                        events: vec![AipEvent {
+                            name: String::from("retaliate"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::AttackAttacker],
+                        }],
+                    }),
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let chase_target = app.world.spawn_empty().id();
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_move(Vec3::new(10.0, 0.0, 0.0), Some(chase_target), None),
+                NextCommand::with_attack(chase_target),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                StatusEffects::default(),
+            ))
+            .id();
+
+        app.world
+            .get_mut::<crate::game::components::NpcAi>(entity)
+            .expect("expected npc ai")
+            .pending_damage
+            .push((
+                attacker_entity,
+                Damage {
+                    amount: 25,
+                    is_critical: false,
+                    apply_hit_stun: false,
+                },
+            ));
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+    }
+
+    #[test]
+    fn npc_ai_damage_from_current_target_skips_attack_move_when_damage_ai_keeps_target() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 0,
+                    trigger_on_created: None,
+                    trigger_on_idle: None,
+                    trigger_on_attack_move: Some(AipTrigger {
+                        name: String::from("attack_move"),
+                        events: vec![AipEvent {
+                            name: String::from("sidestep"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::MoveRandomDistance(
+                                rose_file_readers::AipMoveOrigin::CurrentPosition,
+                                rose_file_readers::AipMoveMode::Run,
+                                300,
+                            )],
+                        }],
+                    }),
+                    trigger_on_damaged: Some(AipTrigger {
+                        name: String::from("damaged"),
+                        events: vec![AipEvent {
+                            name: String::from("retaliate_only_if_no_target"),
+                            conditions: vec![rose_file_readers::AipCondition::NoTargetAndCompareAttackerAbilityValue(
+                                rose_file_readers::AipOperatorType::GreaterThanEqual,
+                                rose_file_readers::AipAbilityType::Level,
+                                0,
+                            )],
+                            actions: vec![AipAction::AttackAttacker],
+                        }],
+                    }),
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_move(Vec3::new(10.0, 0.0, 0.0), Some(attacker_entity), None),
+                NextCommand::with_attack(attacker_entity),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                DamageSources::new(4),
+                StatusEffects::default(),
+            ))
+            .id();
+
+        {
+            let mut npc_ai = app
+                .world
+                .get_mut::<crate::game::components::NpcAi>(entity)
+                .expect("expected npc ai");
+            npc_ai.pending_damage.push((
+                attacker_entity,
+                Damage {
+                    amount: 25,
+                    is_critical: false,
+                    apply_hit_stun: false,
+                },
+            ));
+        }
+
+        {
+            let mut damage_sources = app
+                .world
+                .get_mut::<DamageSources>(entity)
+                .expect("expected damage sources");
+            damage_sources.damage_sources.push(DamageSource {
+                entity: attacker_entity,
+                total_damage: 25,
+                first_damage_time: std::time::Instant::now(),
+                last_damage_time: std::time::Instant::now(),
+            });
+        }
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+    }
+
+    #[test]
+    fn npc_ai_recent_damage_source_reacquires_target_after_stop() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 0,
+                    trigger_on_created: None,
+                    trigger_on_idle: Some(AipTrigger {
+                        name: String::from("idle"),
+                        events: vec![AipEvent {
+                            name: String::from("wander"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::MoveRandomDistance(
+                                rose_file_readers::AipMoveOrigin::CurrentPosition,
+                                rose_file_readers::AipMoveMode::Walk,
+                                200,
+                            )],
+                        }],
+                    }),
+                    trigger_on_attack_move: None,
+                    trigger_on_damaged: None,
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_stop(),
+                NextCommand::default(),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                DamageSources::new(4),
+                StatusEffects::default(),
+            ))
+            .id();
+
+        {
+            let mut damage_sources = app
+                .world
+                .get_mut::<DamageSources>(entity)
+                .expect("expected damage sources");
+            damage_sources.damage_sources.push(DamageSource {
+                entity: attacker_entity,
+                total_damage: 50,
+                first_damage_time: std::time::Instant::now(),
+                last_damage_time: std::time::Instant::now(),
+            });
+        }
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+    }
+
+    #[test]
+    fn npc_ai_recent_damage_overrides_non_combat_followup() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 0,
+                    trigger_on_created: None,
+                    trigger_on_idle: None,
+                    trigger_on_attack_move: None,
+                    trigger_on_damaged: None,
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let attacker_entity = app
+            .world
+            .spawn((
+                crate::game::components::Position::new(Vec3::new(50.0, 0.0, 0.0), zone_id),
+                rose_game_common::components::Level::new(10),
+                rose_game_common::components::Team::default_character(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values.clone(),
+            ))
+            .id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_attack(attacker_entity, Duration::from_secs(1)),
+                NextCommand::with_move(Vec3::new(250.0, 0.0, 0.0), None, None),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                DamageSources::new(4),
+                StatusEffects::default(),
+            ))
+            .id();
+
+        {
+            let mut damage_sources = app
+                .world
+                .get_mut::<DamageSources>(entity)
+                .expect("expected damage sources");
+            damage_sources.damage_sources.push(DamageSource {
+                entity: attacker_entity,
+                total_damage: 50,
+                first_damage_time: std::time::Instant::now(),
+                last_damage_time: std::time::Instant::now(),
+            });
+        }
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == attacker_entity
+        ));
+    }
+
+    #[test]
+    fn npc_ai_attack_move_targetless_reposition_keeps_chase_target() {
+        let mut game_data = load_test_game_data();
+        let npc_id = game_data
+            .npcs
+            .iter()
+            .next()
+            .expect("expected at least one npc in test data")
+            .id;
+        let zone_id = game_data
+            .zones
+            .iter()
+            .next()
+            .expect("expected at least one zone in test data")
+            .id;
+
+        game_data.ai = Arc::new(AiDatabase {
+            strings: HashMap::new(),
+            aips: HashMap::from([(
+                1u16,
+                AipFile {
+                    idle_trigger_interval: Duration::from_secs(1),
+                    damage_trigger_new_target_chance: 0,
+                    trigger_on_created: None,
+                    trigger_on_idle: None,
+                    trigger_on_attack_move: Some(AipTrigger {
+                        name: String::from("attack_move"),
+                        events: vec![AipEvent {
+                            name: String::from("sidestep"),
+                            conditions: Vec::new(),
+                            actions: vec![AipAction::MoveRandomDistance(
+                                rose_file_readers::AipMoveOrigin::CurrentPosition,
+                                rose_file_readers::AipMoveMode::Run,
+                                300,
+                            )],
+                        }],
+                    }),
+                    trigger_on_damaged: None,
+                    trigger_on_kill: None,
+                    trigger_on_dead: None,
+                },
+            )]),
+        });
+
+        let mut app = create_test_app(game_data);
+        let ability_values = app
+            .world
+            .resource::<GameData>()
+            .ability_value_calculator
+            .calculate_npc(npc_id, &StatusEffects::default(), None, None)
+            .expect("expected npc ability values");
+
+        let target_entity = app.world.spawn_empty().id();
+
+        let entity = app
+            .world
+            .spawn((
+                rose_game_common::components::Npc::new(npc_id, 0),
+                crate::game::components::NpcAi::new(1),
+                ClientEntity::new(ClientEntityType::Monster, ClientEntityId(1), zone_id),
+                crate::game::components::ClientEntitySector::new(UVec2::ZERO),
+                Command::with_move(Vec3::new(250.0, 0.0, 0.0), Some(target_entity), None),
+                NextCommand::with_attack(target_entity),
+                crate::game::components::Position::new(Vec3::ZERO, zone_id),
+                rose_game_common::components::Level::new(1),
+                rose_game_common::components::Team::default_monster(),
+                rose_game_common::components::HealthPoints::new(ability_values.get_max_health()),
+                ability_values,
+                StatusEffects::default(),
+            ))
+            .id();
+
+        app.update();
+
+        let next_command = app
+            .world
+            .get::<NextCommand>(entity)
+            .expect("expected next command after npc ai update");
+
+        assert!(matches!(
+            next_command.command,
+            Some(CommandData::Attack { target }) if target == target_entity
+        ));
+    }
+
     #[test]
     fn npc_ai_runs_attack_move_trigger_during_chase() {
         let mut game_data = load_test_game_data();
@@ -2461,19 +3444,7 @@ mod tests {
             )]),
         });
 
-        let mut app = App::new();
-        app.insert_resource(Time::default());
-        app.insert_resource(WorldTime::new());
-        app.insert_resource(ServerMessages::default());
-        app.insert_resource(WorldRates::new());
-        app.insert_resource(ZoneList::new());
-        app.insert_resource(ClientEntityList::new(&game_data.zones));
-        app.insert_resource(game_data);
-        app.add_event::<crate::game::events::DamageEvent>();
-        app.add_event::<crate::game::events::QuestTriggerEvent>();
-        app.add_event::<crate::game::events::RewardItemEvent>();
-        app.add_event::<crate::game::events::RewardXpEvent>();
-        app.add_systems(Update, npc_ai_system);
+        let mut app = create_test_app(game_data);
 
         let target_entity = app.world.spawn_empty().id();
         let ability_values = app
@@ -2517,7 +3488,8 @@ mod tests {
     fn load_test_game_data() -> GameData {
         let assets_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..");
+            .join("..")
+            .join("GameFiles");
         let vfs = VirtualFilesystem::new(vec![Box::new(HostFilesystemDevice::new(assets_root))]);
         let string_database = get_string_database(&vfs, 1).expect("failed to load string database");
         let item_database = Arc::new(
