@@ -3,6 +3,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context};
@@ -98,14 +99,46 @@ enum AppState {
     Error(String),
 }
 
+#[derive(Clone, Copy)]
+enum SourceKind {
+    PackedDataIdx,
+    ExtractedData,
+}
+
+impl SourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            SourceKind::PackedDataIdx => "Packed data.idx",
+            SourceKind::ExtractedData => "Extracted 3DDATA",
+        }
+    }
+}
+
+enum SaveTarget {
+    Packed {
+        data_idx_path: PathBuf,
+        writer_index: VfsIndex,
+    },
+    Extracted {
+        root_path: PathBuf,
+    },
+}
+
+struct ResolvedInputSource {
+    source_kind: SourceKind,
+    display_path: PathBuf,
+    save_target: SaveTarget,
+}
+
 pub struct ShopEditorApp {
     state: AppState,
 }
 
 struct EditorData {
-    root_path: PathBuf,
-    data_idx_path: PathBuf,
-    writer_index: VfsIndex,
+    input_path: PathBuf,
+    source_kind: SourceKind,
+    source_display_path: PathBuf,
+    save_target: SaveTarget,
     string_database: Arc<StringDatabase>,
     item_database: Arc<ItemDatabase>,
     npc_database: Arc<NpcDatabase>,
@@ -158,10 +191,8 @@ impl eframe::App for ShopEditorApp {
 
 impl EditorData {
     fn load(input_path: PathBuf, egui_ctx: &egui::Context) -> Result<Self, anyhow::Error> {
-        let (root_path, data_idx_path) = resolve_input_paths(&input_path)?;
-        let reader_index = VfsIndex::load(&data_idx_path)
-            .with_context(|| format!("Failed to load {}", data_idx_path.display()))?;
-        let vfs = VirtualFilesystem::new(vec![Box::new(reader_index)]);
+        let resolved_input = resolve_input_source(&input_path)?;
+        let vfs = create_virtual_filesystem(&resolved_input)?;
 
         let string_database = get_string_database(&vfs, 1)?;
         let item_database = Arc::new(get_item_database(&vfs, string_database.clone())?);
@@ -177,7 +208,6 @@ impl EditorData {
 
         let list_npc = vfs.read_file::<StbFile, _>(LIST_NPC_PATH)?;
         let list_sell = vfs.read_file::<StbFile, _>(LIST_SELL_PATH)?;
-        let writer_index = VfsIndex::load(&data_idx_path)?;
 
         let shopkeeper_npc_ids = npc_database
             .iter()
@@ -199,22 +229,28 @@ impl EditorData {
         let (item_icons, status_message) = match load_item_icons(&vfs, egui_ctx) {
             Ok(item_icons) => (
                 Some(item_icons),
-                format!("Opened {}", data_idx_path.display()),
+                format!(
+                    "Opened {} from {}",
+                    resolved_input.source_kind.label(),
+                    resolved_input.display_path.display()
+                ),
             ),
             Err(error) => (
                 None,
                 format!(
-                    "Opened {}. Item icons unavailable: {}",
-                    data_idx_path.display(),
+                    "Opened {} from {}. Item icons unavailable: {}",
+                    resolved_input.source_kind.label(),
+                    resolved_input.display_path.display(),
                     error
                 ),
             ),
         };
 
         Ok(Self {
-            root_path,
-            data_idx_path,
-            writer_index,
+            input_path,
+            source_kind: resolved_input.source_kind,
+            source_display_path: resolved_input.display_path,
+            save_target: resolved_input.save_target,
             string_database,
             item_database,
             npc_database,
@@ -245,7 +281,11 @@ impl EditorData {
         TopBottomPanel::top("shop_editor_top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("ROSE NPC Shop Editor");
-                ui.label(self.data_idx_path.display().to_string());
+                ui.label(format!(
+                    "{}: {}",
+                    self.source_kind.label(),
+                    self.source_display_path.display()
+                ));
                 if ui
                     .add_enabled(self.dirty, Button::new("Save Changes"))
                     .clicked()
@@ -255,7 +295,7 @@ impl EditorData {
                     }
                 }
                 if ui.button("Reload").clicked() {
-                    match EditorData::load(self.root_path.clone(), ctx) {
+                    match EditorData::load(self.input_path.clone(), ctx) {
                         Ok(reloaded) => *self = reloaded,
                         Err(error) => {
                             self.status_message = format!("Reload failed: {error:#}");
@@ -802,15 +842,21 @@ impl EditorData {
             (VfsPathBuf::new(LIST_SELL_PATH), sell_writer.buffer.to_vec()),
         ]);
 
-        let result = self
-            .writer_index
-            .rewrite_files(&self.data_idx_path, &replacements)?;
-        self.writer_index = VfsIndex::load(&self.data_idx_path)?;
+        let backup_count = match &mut self.save_target {
+            SaveTarget::Packed {
+                data_idx_path,
+                writer_index,
+            } => {
+                let result = writer_index.rewrite_files(data_idx_path, &replacements)?;
+                *writer_index = VfsIndex::load(data_idx_path)?;
+                result.backups.len()
+            }
+            SaveTarget::Extracted { root_path } => {
+                save_extracted_files(root_path, &replacements)?.len()
+            }
+        };
         self.dirty = false;
-        self.status_message = format!(
-            "Saved shop data. Created {} backup file(s).",
-            result.backups.len()
-        );
+        self.status_message = format!("Saved shop data. Created {} backup file(s).", backup_count);
         Ok(())
     }
 }
@@ -1147,41 +1193,178 @@ fn image_format_for_filename(filename: &str, bytes: &[u8]) -> Result<ImageFormat
     }
 }
 
-fn resolve_input_paths(input_path: &Path) -> Result<(PathBuf, PathBuf), anyhow::Error> {
-    let candidate_path = if input_path.is_file() {
-        input_path.to_path_buf()
-    } else {
-        input_path.join("data.idx")
-    };
+fn create_virtual_filesystem(
+    resolved_input: &ResolvedInputSource,
+) -> Result<VirtualFilesystem, anyhow::Error> {
+    match &resolved_input.save_target {
+        SaveTarget::Packed { data_idx_path, .. } => {
+            let reader_index = VfsIndex::load(data_idx_path)
+                .with_context(|| format!("Failed to load {}", data_idx_path.display()))?;
+            Ok(VirtualFilesystem::new(vec![Box::new(reader_index)]))
+        }
+        SaveTarget::Extracted { root_path } => Ok(VirtualFilesystem::new(vec![Box::new(
+            rose_file_readers::HostFilesystemDevice::new(root_path.clone()),
+        )])),
+    }
+}
 
-    if candidate_path.file_name().and_then(|name| name.to_str()) != Some("data.idx") {
+fn resolve_input_source(input_path: &Path) -> Result<ResolvedInputSource, anyhow::Error> {
+    if input_path.is_file() {
+        if input_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("data.idx"))
+            .unwrap_or(false)
+        {
+            return Ok(ResolvedInputSource {
+                source_kind: SourceKind::PackedDataIdx,
+                display_path: input_path.to_path_buf(),
+                save_target: SaveTarget::Packed {
+                    data_idx_path: input_path.to_path_buf(),
+                    writer_index: VfsIndex::load(input_path)
+                        .with_context(|| format!("Failed to load {}", input_path.display()))?,
+                },
+            });
+        }
+
         return Err(anyhow!(
-            "Input must be a ROSE root directory or a data.idx file path"
+            "Input file must be a data.idx path, or choose an extracted data folder"
         ));
     }
 
-    if !candidate_path.exists() {
-        let root_path = candidate_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(PathBuf::new);
-        if root_path.join("data.prf").exists()
-            || root_path.join("data.trf").exists()
-            || root_path.join("data.rose").exists()
+    if !input_path.is_dir() {
+        return Err(anyhow!("Could not find {}", input_path.display()));
+    }
+
+    let packed_candidate = input_path.join("data.idx");
+    if packed_candidate.exists() {
+        if input_path.join("data.prf").exists()
+            || input_path.join("data.trf").exists()
+            || input_path.join("data.rose").exists()
         {
             return Err(anyhow!(
                 "Only the standard ROSE data.idx format is supported by this editor"
             ));
         }
 
-        return Err(anyhow!("Could not find {}", candidate_path.display()));
+        return Ok(ResolvedInputSource {
+            source_kind: SourceKind::PackedDataIdx,
+            display_path: packed_candidate.clone(),
+            save_target: SaveTarget::Packed {
+                data_idx_path: packed_candidate.clone(),
+                writer_index: VfsIndex::load(&packed_candidate)
+                    .with_context(|| format!("Failed to load {}", packed_candidate.display()))?,
+            },
+        });
     }
 
-    let root_path = candidate_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(PathBuf::new);
-    Ok((root_path, candidate_path))
+    if looks_like_extracted_root(input_path) {
+        return Ok(ResolvedInputSource {
+            source_kind: SourceKind::ExtractedData,
+            display_path: input_path.join("3DDATA"),
+            save_target: SaveTarget::Extracted {
+                root_path: input_path.to_path_buf(),
+            },
+        });
+    }
+
+    if looks_like_3ddata_folder(input_path) {
+        let root_path = input_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| input_path.to_path_buf());
+        return Ok(ResolvedInputSource {
+            source_kind: SourceKind::ExtractedData,
+            display_path: input_path.to_path_buf(),
+            save_target: SaveTarget::Extracted { root_path },
+        });
+    }
+
+    Err(anyhow!(
+        "Input must be a ROSE root folder with data.idx, a data.idx file, an extracted data root containing 3DDATA, or the extracted 3DDATA folder itself"
+    ))
+}
+
+fn looks_like_extracted_root(path: &Path) -> bool {
+    path.join(LIST_NPC_PATH).exists() && path.join(LIST_SELL_PATH).exists()
+}
+
+fn looks_like_3ddata_folder(path: &Path) -> bool {
+    path.join("STB").join("LIST_NPC.STB").exists()
+        && path.join("STB").join("LIST_SELL.STB").exists()
+}
+
+fn save_extracted_files(
+    root_path: &Path,
+    replacements: &HashMap<VfsPathBuf, Vec<u8>>,
+) -> Result<Vec<PathBuf>, anyhow::Error> {
+    let timestamp = backup_timestamp();
+    let mut backups = Vec::new();
+
+    for (vfs_path, bytes) in replacements {
+        let target_path = root_path.join(vfs_path.path());
+        if let Some(parent_path) = target_path.parent() {
+            std::fs::create_dir_all(parent_path)
+                .with_context(|| format!("Failed to create directory {}", parent_path.display()))?;
+        }
+
+        if target_path.exists() {
+            backups.push(create_file_backup(&target_path, &timestamp)?);
+        }
+
+        let temp_path = extracted_temp_file_path(&target_path, &timestamp);
+        std::fs::write(&temp_path, bytes)
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        replace_extracted_file(&target_path, &temp_path)?;
+    }
+
+    Ok(backups)
+}
+
+fn backup_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| String::from("0"))
+}
+
+fn extracted_temp_file_path(path: &Path, timestamp: &str) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("temp"));
+    path.with_file_name(format!("{}.{}.tmp", filename, timestamp))
+}
+
+fn create_file_backup(path: &Path, timestamp: &str) -> Result<PathBuf, anyhow::Error> {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("backup"));
+    let backup_path = path.with_file_name(format!("{}.{}.bak", filename, timestamp));
+    std::fs::copy(path, &backup_path).with_context(|| {
+        format!(
+            "Failed to create backup {} from {}",
+            backup_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(backup_path)
+}
+
+fn replace_extracted_file(target_path: &Path, temp_path: &Path) -> Result<(), anyhow::Error> {
+    if target_path.exists() {
+        std::fs::remove_file(target_path)
+            .with_context(|| format!("Failed to remove {}", target_path.display()))?;
+    }
+    std::fs::rename(temp_path, target_path).with_context(|| {
+        format!(
+            "Failed to move {} into place at {}",
+            temp_path.display(),
+            target_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn build_zone_shopkeepers(

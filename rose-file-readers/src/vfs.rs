@@ -246,6 +246,10 @@ fn write_vfs_string(writer: &mut RoseFileWriter, value: &str) {
     writer.write_u16_length_bytes(&bytes);
 }
 
+fn format_vfs_path(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\")
+}
+
 fn build_storage_bytes(
     storage: &Storage,
     replacements: &HashMap<PathBuf, &[u8]>,
@@ -324,7 +328,7 @@ fn build_index_bytes(
         writer.write_u32(0);
         writer.write_u32(0);
         for entry in entries {
-            write_vfs_string(&mut writer, &entry.path.to_string_lossy());
+            write_vfs_string(&mut writer, &format_vfs_path(&entry.path));
             writer.write_u32(entry.offset as u32);
             writer.write_u32(entry.size as u32);
             writer.write_u32(entry.block_size);
@@ -494,5 +498,41 @@ mod tests {
             },
             b"STORE!"
         );
+    }
+
+    #[test]
+    fn rewrite_files_preserves_backslash_vfs_paths() {
+        let dir = tempdir().unwrap();
+        create_test_vfs(dir.path());
+
+        let index_path = dir.path().join("data.idx");
+        let vfs = VfsIndex::load(&index_path).unwrap();
+        let mut replacements = HashMap::new();
+        replacements.insert(
+            VfsPathBuf::new("3DDATA/STB/LIST_NPC.STB"),
+            b"HELLO!".to_vec(),
+        );
+
+        vfs.rewrite_files(&index_path, &replacements).unwrap();
+
+        let data = std::fs::read(&index_path).unwrap();
+        let mut reader = RoseFileReader::from(data.as_slice());
+        reader.read_u32().unwrap();
+        reader.read_u32().unwrap();
+        reader.read_u32().unwrap();
+
+        let _root_name = decode_vfs_string(reader.read_u16_length_bytes().unwrap());
+        let _root_offset = reader.read_u32().unwrap();
+        let _storage_name = decode_vfs_string(reader.read_u16_length_bytes().unwrap());
+        let storage_offset = reader.read_u32().unwrap() as u64;
+
+        reader.set_position(storage_offset);
+        let entry_count = reader.read_u32().unwrap();
+        assert_eq!(entry_count, 2);
+        reader.read_u32().unwrap();
+        reader.read_u32().unwrap();
+
+        let first_path = decode_vfs_string(reader.read_u16_length_bytes().unwrap());
+        assert_eq!(first_path, "3DDATA\\STB\\LIST_NPC.STB");
     }
 }
