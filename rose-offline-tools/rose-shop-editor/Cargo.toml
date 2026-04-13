@@ -1,0 +1,17 @@
+[package]
+name = "rose-shop-editor"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+rose-data = { path = "../../rose-data" }
+rose-data-irose = { path = "../../rose-data-irose" }
+rose-file-readers = { path = "../../rose-file-readers" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+ddsfile = "0.5"
+eframe = "0.27"
+image = { version = "0.24", default-features = false, features = ["bmp", "dds", "png", "tga"] }
+rfd = "0.14"
+texpresso = "2"

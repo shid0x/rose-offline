@@ -1,16 +1,17 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use core::mem::size_of;
-use std::{collections::HashMap, str};
+use std::collections::HashMap;
 
-use crate::{reader::RoseFileReader, RoseFile};
+use crate::{reader::RoseFileReader, RoseFile, RoseFileWriter};
 
 pub struct StbFile {
-    rows: usize,
-    columns: usize,
+    version: u8,
+    row_height: u32,
+    column_widths: Vec<u8>,
+    column_names: Vec<String>,
+    row_name_header: String,
     row_names: Vec<String>,
-    _column_names: Vec<String>,
-    data: Vec<u8>,
-    cells: Vec<(usize, u16)>,
+    cells: Vec<String>,
     row_keys: HashMap<String, usize>,
 }
 
@@ -39,10 +40,90 @@ impl RoseFile for StbFile {
 
         StbFile::read_data(reader, read_options)
     }
+
+    fn write(
+        &self,
+        writer: &mut RoseFileWriter,
+        _options: &Self::WriteOptions,
+    ) -> Result<(), anyhow::Error> {
+        writer.buffer.extend_from_slice(b"STB");
+        writer.write_u8(match self.version {
+            0 => b'0',
+            1 => b'1',
+            version => return Err(anyhow!("Unsupported STB version: {}", version)),
+        });
+
+        let data_position_offset = writer.buffer.len();
+        writer.write_u32(0);
+        writer.write_u32((self.rows() + 1) as u32);
+        writer.write_u32((self.columns() + 1) as u32);
+        writer.write_u32(self.row_height);
+
+        writer.buffer.extend_from_slice(&self.column_widths);
+
+        for column_name in &self.column_names {
+            writer.write_u16_length_string(column_name);
+        }
+
+        writer.write_u16_length_string(&self.row_name_header);
+        for row_name in &self.row_names {
+            writer.write_u16_length_string(row_name);
+        }
+
+        let data_position = writer.buffer.len() as u32;
+        writer.buffer[data_position_offset..data_position_offset + 4]
+            .copy_from_slice(&data_position.to_le_bytes());
+
+        for cell in &self.cells {
+            writer.write_u16_length_string(cell);
+        }
+
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
 impl StbFile {
+    pub fn new(
+        version: u8,
+        row_height: u32,
+        column_names: Vec<String>,
+        row_name_header: impl Into<String>,
+        row_names: Vec<String>,
+        cells: Vec<String>,
+    ) -> Result<Self, anyhow::Error> {
+        ensure!(
+            version == 0 || version == 1,
+            "Unsupported STB version: {}",
+            version
+        );
+        let columns = column_names.len().saturating_sub(1);
+        ensure!(
+            cells.len() == row_names.len() * columns,
+            "Expected {} STB cells, got {}",
+            row_names.len() * columns,
+            cells.len()
+        );
+
+        let column_widths = if version == 0 {
+            vec![0; size_of::<u32>()]
+        } else {
+            vec![0; size_of::<u16>() * (column_names.len() + 1)]
+        };
+        let row_keys = Self::build_row_keys(&row_names, true);
+
+        Ok(Self {
+            version,
+            row_height,
+            column_widths,
+            column_names,
+            row_name_header: row_name_header.into(),
+            row_names,
+            cells,
+            row_keys,
+        })
+    }
+
     fn read_data(
         mut reader: RoseFileReader,
         read_options: &StbReadOptions,
@@ -61,71 +142,92 @@ impl StbFile {
         let data_position = reader.read_u32()? as u64;
         let row_count = reader.read_u32()? as usize;
         let column_count = reader.read_u32()? as usize;
-        let _row_height = reader.read_u32()?;
+        let row_height = reader.read_u32()?;
 
-        // column widths
-        if version == 0 {
-            reader.skip(size_of::<u32>() as u64);
+        let column_widths = if version == 0 {
+            reader.read_fixed_length_bytes(size_of::<u32>())?.to_vec()
         } else {
-            reader.skip((size_of::<u16>() * (column_count + 1)) as u64);
-        }
+            reader
+                .read_fixed_length_bytes(size_of::<u16>() * (column_count + 1))?
+                .to_vec()
+        };
 
         let mut column_names = Vec::with_capacity(column_count);
         for _ in 0..column_count {
             column_names.push(String::from(reader.read_u16_length_string()?));
         }
 
-        // Ignore the row / column headers
-        let rows = row_count - 1;
-        let columns = column_count - 1;
+        let rows = row_count.saturating_sub(1);
+        let columns = column_count.saturating_sub(1);
 
-        reader.read_u16_length_string()?; // Ignore column title line
+        let row_name_header = String::from(reader.read_u16_length_string()?);
 
-        let mut row_names = Vec::with_capacity(row_count);
+        let mut row_names = Vec::with_capacity(rows);
         for _ in 0..rows {
             row_names.push(String::from(reader.read_u16_length_string()?));
         }
 
-        let mut data = Vec::with_capacity(reader.remaining());
-        let mut cells = Vec::with_capacity(row_count * column_count);
+        let mut cells = Vec::with_capacity(rows * columns);
 
         reader.set_position(data_position);
         for _ in 0..rows {
             for _ in 0..columns {
-                let cell = reader.read_u16_length_string()?;
-                let size = cell.as_bytes().len();
-                let position = data.len();
-                data.extend_from_slice(cell.as_bytes());
-                cells.push((position, size as u16));
+                cells.push(String::from(reader.read_u16_length_string()?));
             }
         }
 
+        let row_keys = Self::build_row_keys(&row_names, read_options.with_keys);
+
+        Ok(Self {
+            version,
+            row_height,
+            column_widths,
+            column_names,
+            row_name_header,
+            row_names,
+            cells,
+            row_keys,
+        })
+    }
+
+    fn build_row_keys(row_names: &[String], with_keys: bool) -> HashMap<String, usize> {
         let mut row_keys = HashMap::new();
-        if read_options.with_keys {
+        if with_keys {
             for (index, key) in row_names.iter().enumerate() {
                 if !key.is_empty() {
                     row_keys.insert(key.clone(), index);
                 }
             }
         }
+        row_keys
+    }
 
-        Ok(Self {
-            rows,
-            columns,
-            row_names,
-            _column_names: column_names,
-            data,
-            cells,
-            row_keys,
-        })
+    fn cell_index(&self, row: usize, column: usize) -> Option<usize> {
+        if row >= self.rows() || column >= self.columns() {
+            None
+        } else {
+            Some(row * self.columns() + column)
+        }
+    }
+
+    fn rebuild_row_keys(&mut self) {
+        self.row_keys = Self::build_row_keys(&self.row_names, true);
     }
 
     pub fn rows(&self) -> usize {
-        self.rows
+        self.row_names.len()
     }
 
     pub fn columns(&self) -> usize {
-        self.columns
+        self.column_names.len().saturating_sub(1)
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub fn row_height(&self) -> u32 {
+        self.row_height
     }
 
     pub fn lookup_row_name(&self, name: &str) -> Option<usize> {
@@ -140,21 +242,73 @@ impl StbFile {
         self.try_get_row_name(row).unwrap_or("")
     }
 
-    pub fn try_get(&self, row: usize, column: usize) -> Option<&str> {
-        let cell_index = row * self.columns + column;
-        if row >= self.rows || column >= self.columns || cell_index >= self.cells.len() {
-            return None;
-        }
+    pub fn set_row_name(
+        &mut self,
+        row: usize,
+        value: impl Into<String>,
+    ) -> Result<(), anyhow::Error> {
+        let row_name = self
+            .row_names
+            .get_mut(row)
+            .ok_or_else(|| anyhow!("Invalid STB row {}", row))?;
+        *row_name = value.into();
+        self.rebuild_row_keys();
+        Ok(())
+    }
 
-        let (position, size) = self.cells[row * self.columns + column];
-        if size == 0 {
-            return None;
+    pub fn row_name_header(&self) -> &str {
+        &self.row_name_header
+    }
+
+    pub fn column_name(&self, column: usize) -> Option<&str> {
+        self.column_names.get(column).map(String::as_str)
+    }
+
+    pub fn try_get(&self, row: usize, column: usize) -> Option<&str> {
+        let cell_index = self.cell_index(row, column)?;
+        let value = self.cells.get(cell_index)?;
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.as_str())
         }
-        str::from_utf8(&self.data[position..(position + size as usize)]).ok()
     }
 
     pub fn get(&self, row: usize, column: usize) -> &str {
         self.try_get(row, column).unwrap_or("")
+    }
+
+    pub fn set(
+        &mut self,
+        row: usize,
+        column: usize,
+        value: impl Into<String>,
+    ) -> Result<(), anyhow::Error> {
+        let cell_index = self
+            .cell_index(row, column)
+            .ok_or_else(|| anyhow!("Invalid STB cell ({}, {})", row, column))?;
+        self.cells[cell_index] = value.into();
+        Ok(())
+    }
+
+    pub fn push_row(
+        &mut self,
+        row_name: impl Into<String>,
+        values: impl IntoIterator<Item = String>,
+    ) -> Result<usize, anyhow::Error> {
+        let values: Vec<String> = values.into_iter().collect();
+        ensure!(
+            values.len() == self.columns(),
+            "Expected {} STB cells, got {}",
+            self.columns(),
+            values.len()
+        );
+
+        let row_index = self.rows();
+        self.row_names.push(row_name.into());
+        self.cells.extend(values);
+        self.rebuild_row_keys();
+        Ok(row_index)
     }
 
     pub fn try_get_int(&self, row: usize, column: usize) -> Option<i32> {
@@ -253,4 +407,74 @@ macro_rules! stb_column {
             result
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StbFile;
+    use crate::{RoseFile, RoseFileWriter, StbReadOptions};
+
+    fn make_test_stb() -> StbFile {
+        let bytes: &[u8] = &[
+            b'S', b'T', b'B', b'1', 0x27, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00, 0x20, 0x00,
+            0x00, 0x00, 0x01, 0x00, b'R', 0x02, 0x00, b'C', b'1', 0x02, 0x00, b'C', b'2', 0x02,
+            0x00, b'C', b'3', 0x01, 0x00, b'#', 0x02, 0x00, b'R', b'1', 0x02, 0x00, b'R', b'2',
+            0x02, 0x00, b'A', b'1', 0x02, 0x00, b'B', b'1', 0x00, 0x00, 0x02, 0x00, b'A', b'2',
+            0x00, 0x00, 0x02, 0x00, b'C', b'2',
+        ];
+        StbFile::read(
+            bytes.into(),
+            &StbReadOptions {
+                with_keys: true,
+                is_wide: false,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stb_round_trip_preserves_logical_content() {
+        let stb = make_test_stb();
+        let mut writer = RoseFileWriter::default();
+        stb.write(&mut writer, &()).unwrap();
+
+        let reread = StbFile::read(
+            writer.buffer.as_ref().into(),
+            &StbReadOptions {
+                with_keys: true,
+                is_wide: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reread.version(), 1);
+        assert_eq!(reread.rows(), 2);
+        assert_eq!(reread.columns(), 3);
+        assert_eq!(reread.get_row_name(0), "R1");
+        assert_eq!(reread.get_row_name(1), "R2");
+        assert_eq!(reread.get(0, 0), "A1");
+        assert_eq!(reread.get(0, 1), "B1");
+        assert_eq!(reread.get(0, 2), "");
+        assert_eq!(reread.get(1, 0), "A2");
+        assert_eq!(reread.get(1, 1), "");
+        assert_eq!(reread.get(1, 2), "C2");
+        assert_eq!(reread.lookup_row_name("R2"), Some(1));
+    }
+
+    #[test]
+    fn stb_supports_row_and_cell_mutation() {
+        let mut stb = make_test_stb();
+        stb.set(0, 2, "NEW").unwrap();
+        stb.push_row(
+            "SHOP_CLONE_3",
+            vec!["10".to_string(), "tab_key".to_string(), "2001".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(stb.get(0, 2), "NEW");
+        assert_eq!(stb.rows(), 3);
+        assert_eq!(stb.get_row_name(2), "SHOP_CLONE_3");
+        assert_eq!(stb.get(2, 1), "tab_key");
+    }
 }
