@@ -126,6 +126,7 @@ mod tests {
         for case in cases {
             let zone_data = rose_data::ZoneData {
                 id: rose_data::ZoneId::new(1).unwrap(),
+                source_zone_path: std::path::PathBuf::new(),
                 name: "",
                 description: "",
                 pvp_state: case.zone_state,

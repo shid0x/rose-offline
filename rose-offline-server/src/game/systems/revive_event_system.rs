@@ -555,6 +555,7 @@ mod tests {
     fn test_zone_data(zone_id: ZoneId, revive_position: Vec3) -> ZoneData {
         ZoneData {
             id: zone_id,
+            source_zone_path: std::path::PathBuf::new(),
             name: "Test Zone",
             description: "Test Zone",
             pvp_state: 0,

@@ -3,6 +3,7 @@ mod client_entity_list;
 mod control_channel;
 mod game_config;
 mod game_data;
+mod game_data_vfs;
 mod login_tokens;
 mod online_friends;
 mod server_list;
@@ -16,6 +17,7 @@ pub use client_entity_list::{ClientEntityList, ClientEntitySet, ClientEntityZone
 pub use control_channel::ControlChannel;
 pub use game_config::GameConfig;
 pub use game_data::GameData;
+pub use game_data_vfs::GameDataVfs;
 pub use login_tokens::{LoginToken, LoginTokens};
 pub use online_friends::{OnlineFriend, OnlineFriends};
 pub use server_list::{GameServer, ServerList, WorldServer};

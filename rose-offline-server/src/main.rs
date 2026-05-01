@@ -12,6 +12,7 @@ mod protocol;
 
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -167,7 +168,7 @@ async fn async_main() {
         vfs_devices.push(Box::new(HostFilesystemDevice::new(index_root_path)));
     }
 
-    let virtual_filesystem = VirtualFilesystem::new(vfs_devices);
+    let virtual_filesystem = Arc::new(VirtualFilesystem::new(vfs_devices));
 
     let started_load = Instant::now();
     let game_data = irose::get_game_data(&virtual_filesystem);
@@ -176,8 +177,9 @@ async fn async_main() {
     let game_config = GameConfig::default();
 
     let (game_control_tx, game_control_rx) = crossbeam_channel::unbounded();
+    let game_data_vfs = virtual_filesystem.clone();
     std::thread::spawn(move || {
-        game::GameWorld::new(game_control_rx).run(game_config, game_data);
+        game::GameWorld::new(game_control_rx).run(game_config, game_data, game_data_vfs);
     });
 
     let mut login_server = LoginServer::new(

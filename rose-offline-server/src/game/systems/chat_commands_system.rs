@@ -22,7 +22,9 @@ use rand::Rng;
 use rose_data::{
     AbilityType, EquipmentIndex, EquipmentItem, Item, ItemReference, ItemType, NpcId, SkillId,
     StackableItem, StatusEffectData, StatusEffectId, StatusEffectType, ZoneId,
+    ZoneMonsterSpawnPoint,
 };
+use rose_file_readers::{IfoFile, IfoMonsterSpawn, IfoMonsterSpawnPoint, IfoReadOptions};
 use rose_game_common::{
     components::{
         ActiveStatusEffect, BasicStatType, ClanLevel, ClanMark, ClanPoints, DroppedItem,
@@ -40,20 +42,21 @@ use crate::game::{
     },
     bundles::{
         ability_values_add_value, ability_values_set_value, client_entity_teleport_zone,
-        CharacterBundle, ItemDropBundle, MonsterBundle,
+        client_entity_leave_zone, CharacterBundle, ItemDropBundle, MonsterBundle,
     },
     components::{
         AbilityValues, Account, BasicStats, CharacterInfo, ClanMembership, ClientEntity,
         ClientEntitySector, ClientEntityType, Command, Cooldowns, DamageSources,
         EquipmentItemDatabase, GameClient, HealthPoints, Inventory, InventoryPageType, Level,
-        ManaPoints, Money, MotionData, MoveMode, MoveSpeed, NextCommand, PartyMembership,
-        PassiveRecoveryTime, PersonalStore, Position, RecoveryRateBonus, SkillList, SkillPoints,
-        SpawnOrigin, Stamina, StatPoints, StatusEffects, StatusEffectsRegen, Team, UnionMembership,
+        ManaPoints, Money, MonsterSpawnPoint, MonsterSpawnSource, MotionData, MoveMode, MoveSpeed,
+        NextCommand, PartyMembership, PassiveRecoveryTime, PersonalStore, Position,
+        RecoveryRateBonus, SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints,
+        StatusEffects, StatusEffectsRegen, Team, UnionMembership,
         PERSONAL_STORE_ITEM_SLOTS,
     },
     events::{ChatCommandEvent, ClanEvent, DamageEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
-    resources::{BotList, BotListEntry, ClientEntityList, ServerMessages, WorldRates},
+    resources::{BotList, BotListEntry, ClientEntityList, GameDataVfs, ServerMessages, WorldRates},
     GameData,
 };
 
@@ -70,6 +73,30 @@ pub struct ChatCommandParams<'w, 's> {
     server_messages: ResMut<'w, ServerMessages>,
     time: Res<'w, Time>,
     world_rates: ResMut<'w, WorldRates>,
+    game_data_vfs: Res<'w, GameDataVfs>,
+    spawn_point_query: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static MonsterSpawnSource,
+            &'static mut MonsterSpawnPoint,
+            &'static mut Position,
+        ),
+        bevy::ecs::query::Without<GameClient>,
+    >,
+    spawned_monster_query: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static SpawnOrigin,
+            &'static ClientEntity,
+            &'static ClientEntitySector,
+            &'static Position,
+        ),
+        (bevy::ecs::query::Without<GameClient>, bevy::ecs::query::Without<MonsterSpawnSource>),
+    >,
 }
 
 #[derive(WorldQuery)]
@@ -142,6 +169,12 @@ lazy_static! {
                     .arg(Arg::new("zone").required(true))
                     .arg(Arg::new("x"))
                     .arg(Arg::new("y")),
+            )
+            .subcommand(
+                clap::Command::new("spawn_reload")
+                    .arg(Arg::new("zone").required(true))
+                    .arg(Arg::new("block_x").required(true))
+                    .arg(Arg::new("block_y").required(true)),
             )
             .subcommand(
                 clap::Command::new("mon")
@@ -618,6 +651,161 @@ fn create_random_bot_entities(
     bot_entities
 }
 
+fn create_spawn_point_from_ifo(
+    spawn: &IfoMonsterSpawnPoint,
+    object_offset: Vec3,
+    block_x: u32,
+    block_y: u32,
+    source_spawn_index: usize,
+) -> Result<ZoneMonsterSpawnPoint, ChatCommandError> {
+    let transform_spawn_list = |spawn_list: &Vec<IfoMonsterSpawn>| {
+        spawn_list
+            .iter()
+            .map(|IfoMonsterSpawn { id, count, .. }| {
+                NpcId::new(*id as u16)
+                    .map(|npc_id| (npc_id, *count as usize))
+                    .ok_or(ChatCommandError::InvalidArguments)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    Ok(ZoneMonsterSpawnPoint {
+        source_block_x: block_x,
+        source_block_y: block_y,
+        source_spawn_index,
+        position: Vec3::new(
+            spawn.object.position.x,
+            spawn.object.position.y,
+            spawn.object.position.z,
+        ) + object_offset,
+        basic_spawns: transform_spawn_list(&spawn.basic_spawns)?,
+        tactic_spawns: transform_spawn_list(&spawn.tactic_spawns)?,
+        interval: spawn.interval,
+        limit_count: spawn.limit_count,
+        range: spawn.range,
+        tactic_points: spawn.tactic_points,
+    })
+}
+
+fn reload_monster_spawn_block(
+    chat_command_params: &mut ChatCommandParams,
+    zone_id: ZoneId,
+    block_x: u32,
+    block_y: u32,
+) -> Result<(usize, usize), ChatCommandError> {
+    let zone_data = chat_command_params
+        .game_data
+        .zones
+        .get_zone(zone_id)
+        .ok_or(ChatCommandError::InvalidArguments)?;
+    let zone_path = zone_data
+        .source_zone_path
+        .parent()
+        .ok_or(ChatCommandError::InvalidArguments)?;
+    let ifo_path = zone_path.join(format!("{block_x}_{block_y}.IFO"));
+    let ifo_read_options = IfoReadOptions {
+        skip_event_objects: true,
+        skip_monster_spawns: false,
+        skip_npcs: true,
+        skip_animated_objects: true,
+        skip_collision_objects: true,
+        skip_cnst_objects: true,
+        skip_deco_objects: true,
+        skip_effect_objects: true,
+        skip_sound_objects: true,
+        skip_water_planes: true,
+        skip_warp_objects: true,
+    };
+    chat_command_params
+        .game_data_vfs
+        .vfs
+        .refresh_devices()
+        .map_err(|error| ChatCommandError::WithMessage(format!("Reload failed: {error:#}")))?;
+    let ifo_file = chat_command_params
+        .game_data_vfs
+        .vfs
+        .read_file_with::<IfoFile, _>(ifo_path, &ifo_read_options)
+        .map_err(|error| ChatCommandError::WithMessage(format!("Reload failed: {error:#}")))?;
+
+    let object_offset = Vec3::new(
+        (64.0 / 2.0) * (zone_data.grid_size * zone_data.grid_per_patch * 16.0)
+            + (zone_data.grid_size * zone_data.grid_per_patch * 16.0) / 2.0,
+        (64.0 / 2.0) * (zone_data.grid_size * zone_data.grid_per_patch * 16.0)
+            + (zone_data.grid_size * zone_data.grid_per_patch * 16.0) / 2.0,
+        0.0,
+    );
+    let reloaded_spawns = ifo_file
+        .monster_spawns
+        .iter()
+        .enumerate()
+        .map(|(source_spawn_index, spawn)| {
+            create_spawn_point_from_ifo(spawn, object_offset, block_x, block_y, source_spawn_index)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut reloaded_spawn_entities = HashSet::new();
+    for (entity, source, _, _) in chat_command_params.spawn_point_query.iter_mut() {
+        if source.zone_id == zone_id && source.block_x == block_x && source.block_y == block_y {
+            reloaded_spawn_entities.insert(entity);
+        }
+    }
+
+    let mut despawned_monster_count = 0;
+    for (monster_entity, spawn_origin, client_entity, client_entity_sector, position) in
+        chat_command_params.spawned_monster_query.iter()
+    {
+        let SpawnOrigin::MonsterSpawnPoint(spawn_point_entity, _) = spawn_origin else {
+            continue;
+        };
+        if !reloaded_spawn_entities.contains(spawn_point_entity) {
+            continue;
+        }
+
+        client_entity_leave_zone(
+            &mut chat_command_params.commands,
+            &mut chat_command_params.client_entity_list,
+            monster_entity,
+            client_entity,
+            client_entity_sector,
+            position,
+        );
+        chat_command_params.commands.entity(monster_entity).despawn();
+        despawned_monster_count += 1;
+    }
+
+    let mut found_spawns = vec![false; reloaded_spawns.len()];
+    for (entity, source, mut spawn_point, mut position) in
+        chat_command_params.spawn_point_query.iter_mut()
+    {
+        if source.zone_id != zone_id || source.block_x != block_x || source.block_y != block_y {
+            continue;
+        }
+
+        if let Some(reloaded_spawn) = reloaded_spawns.get(source.spawn_index) {
+            found_spawns[source.spawn_index] = true;
+            spawn_point.apply_spawn_data(reloaded_spawn);
+            spawn_point.reset_for_live_reload();
+            position.position = reloaded_spawn.position;
+        } else {
+            chat_command_params.commands.entity(entity).despawn();
+        }
+    }
+
+    for (source_spawn_index, reloaded_spawn) in reloaded_spawns.iter().enumerate() {
+        if found_spawns[source_spawn_index] {
+            continue;
+        }
+
+        chat_command_params.commands.spawn((
+            MonsterSpawnPoint::from(reloaded_spawn),
+            MonsterSpawnSource::new(zone_id, block_x, block_y, source_spawn_index),
+            Position::new(reloaded_spawn.position, zone_id),
+        ));
+    }
+
+    Ok((reloaded_spawns.len(), despawned_monster_count))
+}
+
 fn handle_chat_command(
     chat_command_params: &mut ChatCommandParams,
     chat_command_user: &mut ChatCommandUserQueryItem,
@@ -812,6 +1000,29 @@ fn handle_chat_command(
                 Position::new(Vec3::new(x, y, 0.0), zone_id),
                 Some(chat_command_user.game_client),
             );
+        }
+        ("spawn_reload", arg_matches) => {
+            let zone_id = arg_matches.value_of("zone").unwrap().parse::<ZoneId>()?;
+            let block_x = arg_matches.value_of("block_x").unwrap().parse::<u32>()?;
+            let block_y = arg_matches.value_of("block_y").unwrap().parse::<u32>()?;
+            let (spawn_count, despawned_monster_count) =
+                reload_monster_spawn_block(chat_command_params, zone_id, block_x, block_y)?;
+
+            chat_command_user
+                .game_client
+                .server_message_tx
+                .send(ServerMessage::Whisper {
+                    from: String::from("SERVER"),
+                    text: format!(
+                        "Reloaded {} monster spawn points for zone {} block {}_{}; replaced {} live monsters",
+                        spawn_count,
+                        zone_id.get(),
+                        block_x,
+                        block_y,
+                        despawned_monster_count,
+                    ),
+                })
+                .ok();
         }
         ("ability_values", _) => {
             send_multiline_whisper(

@@ -125,6 +125,15 @@ impl<'a> From<&'a VfsPathBuf> for VfsPath<'a> {
 pub trait VirtualFilesystemDevice {
     fn open_file(&self, path: &VfsPath) -> Result<VfsFile<'_>, anyhow::Error>;
     fn exists(&self, path: &VfsPath) -> bool;
+    fn refresh(&self) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+    fn write_file(&self, path: &VfsPath, _data: &[u8]) -> Result<(), anyhow::Error> {
+        Err(VfsError::FileNotFound(path.path().into()).into())
+    }
+    fn backup_file(&self, path: &VfsPath) -> Result<(), anyhow::Error> {
+        Err(VfsError::FileNotFound(path.path().into()).into())
+    }
 }
 
 pub struct HostFilesystemDevice {
@@ -147,6 +156,35 @@ impl VirtualFilesystemDevice for HostFilesystemDevice {
     fn exists(&self, vfs_path: &VfsPath) -> bool {
         self.root_path.join(vfs_path.path()).exists()
     }
+
+    fn write_file(&self, vfs_path: &VfsPath, data: &[u8]) -> Result<(), anyhow::Error> {
+        let path = self.root_path.join(vfs_path.path());
+        if !path.exists() {
+            return Err(VfsError::FileNotFound(vfs_path.path().into()).into());
+        }
+
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+
+    fn backup_file(&self, vfs_path: &VfsPath) -> Result<(), anyhow::Error> {
+        let path = self.root_path.join(vfs_path.path());
+        if !path.exists() {
+            return Err(VfsError::FileNotFound(vfs_path.path().into()).into());
+        }
+
+        let backup_path = path.with_extension(format!(
+            "{}.bak",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("bak")
+        ));
+        if !backup_path.exists() {
+            std::fs::copy(path, backup_path)?;
+        }
+
+        Ok(())
+    }
 }
 
 pub struct VirtualFilesystem {
@@ -168,6 +206,14 @@ impl VirtualFilesystem {
         }
 
         false
+    }
+
+    pub fn refresh_devices(&self) -> Result<(), anyhow::Error> {
+        for device in &self.devices {
+            device.refresh()?;
+        }
+
+        Ok(())
     }
 
     pub fn open_file<'a>(
@@ -212,5 +258,23 @@ impl VirtualFilesystem {
         let file = self.open_file(&vfs_path)?;
         RoseFile::read(RoseFileReader::from(&file), options)
             .with_context(|| format!("Failed to read {}", vfs_path.path().to_string_lossy()))
+    }
+
+    pub fn write_existing_file<'a>(
+        &self,
+        path: impl Into<VfsPath<'a>>,
+        data: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        let vfs_path: VfsPath = path.into();
+
+        for device in &self.devices {
+            if !device.exists(&vfs_path) {
+                continue;
+            }
+
+            return device.write_file(&vfs_path, data);
+        }
+
+        Err(VfsError::FileNotFound(vfs_path.path().into()).into())
     }
 }

@@ -67,15 +67,23 @@ pub enum LoadZoneError {
 fn create_monster_spawn(
     spawn: &IfoMonsterSpawnPoint,
     object_offset: Vec3,
+    block_x: u32,
+    block_y: u32,
+    source_spawn_index: usize,
 ) -> ZoneMonsterSpawnPoint {
     let transform_spawn_list = |spawn_list: &Vec<IfoMonsterSpawn>| {
         spawn_list
             .iter()
-            .map(|&IfoMonsterSpawn { id, count }| (NpcId::new(id as u16).unwrap(), count as usize))
+            .map(|IfoMonsterSpawn { id, count, .. }| {
+                (NpcId::new(*id as u16).unwrap(), *count as usize)
+            })
             .collect()
     };
 
     ZoneMonsterSpawnPoint {
+        source_block_x: block_x,
+        source_block_y: block_y,
+        source_spawn_index,
         position: Vec3::new(
             spawn.object.position.x,
             spawn.object.position.y,
@@ -195,7 +203,16 @@ fn load_zone(
                     ifo_file
                         .monster_spawns
                         .iter()
-                        .map(|x| create_monster_spawn(x, objects_offset)),
+                        .enumerate()
+                        .map(|(source_spawn_index, x)| {
+                            create_monster_spawn(
+                                x,
+                                objects_offset,
+                                block_x,
+                                block_y,
+                                source_spawn_index,
+                            )
+                        }),
                 );
                 npcs.extend(
                     ifo_file
@@ -280,6 +297,7 @@ fn load_zone(
     );
     Ok(ZoneData {
         id: ZoneId::new(id as u16).unwrap(),
+        source_zone_path: zone_file.path().to_path_buf(),
         name,
         description,
         pvp_state: data.get_zone_pvp_state(id).unwrap_or(0),

@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     path::{Path, PathBuf},
+    sync::RwLock,
 };
 
 use crate::{
@@ -35,9 +36,10 @@ struct Storage {
 
 #[derive(Default)]
 pub struct VfsIndex {
+    index_path: PathBuf,
     pub base_version: u32,
     pub current_version: u32,
-    storages: Vec<Storage>,
+    storages: RwLock<Vec<Storage>>,
 }
 
 pub struct VfsSaveResult {
@@ -120,9 +122,10 @@ impl VfsIndex {
         }
 
         Ok(VfsIndex {
+            index_path: index_path.to_path_buf(),
             base_version,
             current_version,
-            storages,
+            storages: RwLock::new(storages),
         })
     }
 
@@ -130,6 +133,23 @@ impl VfsIndex {
         &self,
         index_path: &Path,
         replacements: &HashMap<VfsPathBuf, Vec<u8>>,
+    ) -> Result<VfsSaveResult, anyhow::Error> {
+        self.rewrite_files_impl(index_path, replacements, true)
+    }
+
+    pub fn rewrite_files_without_backups(
+        &self,
+        index_path: &Path,
+        replacements: &HashMap<VfsPathBuf, Vec<u8>>,
+    ) -> Result<VfsSaveResult, anyhow::Error> {
+        self.rewrite_files_impl(index_path, replacements, false)
+    }
+
+    fn rewrite_files_impl(
+        &self,
+        index_path: &Path,
+        replacements: &HashMap<VfsPathBuf, Vec<u8>>,
+        create_backups: bool,
     ) -> Result<VfsSaveResult, anyhow::Error> {
         if replacements.is_empty() {
             return Ok(VfsSaveResult {
@@ -142,6 +162,10 @@ impl VfsIndex {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(PathBuf::new);
+        let storages = self
+            .storages
+            .read()
+            .map_err(|_| anyhow!("VFS storage lock is poisoned"))?;
 
         let normalized_replacements: HashMap<PathBuf, &[u8]> = replacements
             .iter()
@@ -151,7 +175,7 @@ impl VfsIndex {
         let mut touched_storage_indices = HashSet::new();
         for path in normalized_replacements.keys() {
             let mut found = false;
-            for (storage_index, storage) in self.storages.iter().enumerate() {
+            for (storage_index, storage) in storages.iter().enumerate() {
                 if storage.files.contains_key(path) {
                     touched_storage_indices.insert(storage_index);
                     found = true;
@@ -170,24 +194,26 @@ impl VfsIndex {
         let mut storage_updates = HashMap::new();
         let mut touched_storage_files = Vec::new();
         for &storage_index in &touched_storage_indices {
-            let storage = &self.storages[storage_index];
+            let storage = &storages[storage_index];
             let (bytes, entries) = build_storage_bytes(storage, &normalized_replacements)?;
             storage_updates.insert(storage_index, (bytes, entries));
             touched_storage_files.push(root_path.join(&storage.filename));
         }
 
-        let new_index_bytes = build_index_bytes(self, &storage_updates)?;
+        let new_index_bytes = build_index_bytes(self, &storages, &storage_updates)?;
 
         let timestamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
         let mut backups = Vec::new();
-        backups.push(create_backup(index_path, &timestamp)?);
-        for storage_path in &touched_storage_files {
-            backups.push(create_backup(storage_path, &timestamp)?);
+        if create_backups {
+            backups.push(create_backup(index_path, &timestamp)?);
+            for storage_path in &touched_storage_files {
+                backups.push(create_backup(storage_path, &timestamp)?);
+            }
         }
 
         let mut temp_storage_paths = Vec::new();
         for (&storage_index, (bytes, _)) in &storage_updates {
-            let target_path = root_path.join(&self.storages[storage_index].filename);
+            let target_path = root_path.join(&storages[storage_index].filename);
             let temp_path = temp_file_path(&target_path, &timestamp);
             std::fs::write(&temp_path, bytes)?;
             temp_storage_paths.push((target_path, temp_path));
@@ -209,12 +235,34 @@ impl VfsIndex {
 }
 
 impl VirtualFilesystemDevice for VfsIndex {
+    fn refresh(&self) -> Result<(), anyhow::Error> {
+        if self.index_path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        let refreshed_index = VfsIndex::load(&self.index_path)?;
+        let refreshed_storages = refreshed_index
+            .storages
+            .into_inner()
+            .map_err(|_| anyhow!("VFS storage lock is poisoned"))?;
+        *self
+            .storages
+            .write()
+            .map_err(|_| anyhow!("VFS storage lock is poisoned"))? = refreshed_storages;
+
+        Ok(())
+    }
+
     fn open_file(&self, vfs_path: &VfsPath) -> Result<VfsFile<'_>, anyhow::Error> {
-        for storage in &self.storages {
+        let storages = self
+            .storages
+            .read()
+            .map_err(|_| anyhow!("VFS storage lock is poisoned"))?;
+        for storage in storages.iter() {
             if let Some(entry_index) = storage.files.get(vfs_path.path()) {
                 let entry = &storage.entries[*entry_index];
-                return Ok(VfsFile::View(
-                    &storage.mmap[entry.offset..entry.offset + entry.size],
+                return Ok(VfsFile::Buffer(
+                    storage.mmap[entry.offset..entry.offset + entry.size].to_vec(),
                 ));
             }
         }
@@ -223,13 +271,35 @@ impl VirtualFilesystemDevice for VfsIndex {
     }
 
     fn exists(&self, vfs_path: &VfsPath) -> bool {
-        for storage in &self.storages {
+        let Ok(storages) = self.storages.read() else {
+            return false;
+        };
+        for storage in storages.iter() {
             if storage.files.get(vfs_path.path()).is_some() {
                 return true;
             }
         }
 
         false
+    }
+
+    fn write_file(&self, vfs_path: &VfsPath, data: &[u8]) -> Result<(), anyhow::Error> {
+        if self.index_path.as_os_str().is_empty() {
+            return Err(anyhow!("Cannot write VFS file without an index path"));
+        }
+
+        let current_index = VfsIndex::load(&self.index_path)?;
+        let replacements = HashMap::from([(VfsPathBuf::from(vfs_path), data.to_vec())]);
+        current_index.rewrite_files_without_backups(&self.index_path, &replacements)?;
+
+        self.refresh()?;
+        Ok(())
+    }
+
+    fn backup_file(&self, _vfs_path: &VfsPath) -> Result<(), anyhow::Error> {
+        // VfsIndex::rewrite_files creates timestamped backups for data.idx and every touched
+        // storage file as part of the atomic rewrite.
+        Ok(())
     }
 }
 
@@ -289,19 +359,20 @@ fn build_storage_bytes(
 
 fn build_index_bytes(
     index: &VfsIndex,
+    storages: &[Storage],
     storage_updates: &HashMap<usize, (Vec<u8>, Vec<FileEntry>)>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let mut writer = RoseFileWriter::default();
     writer.write_u32(index.base_version);
     writer.write_u32(index.current_version);
-    writer.write_u32((index.storages.len() + 1) as u32);
+    writer.write_u32((storages.len() + 1) as u32);
 
-    let mut offset_slots = Vec::with_capacity(index.storages.len() + 1);
+    let mut offset_slots = Vec::with_capacity(storages.len() + 1);
     write_vfs_string(&mut writer, "ROOT.VFS");
     offset_slots.push(writer.buffer.len());
     writer.write_u32(0);
 
-    for storage in &index.storages {
+    for storage in storages {
         write_vfs_string(&mut writer, &storage.filename);
         offset_slots.push(writer.buffer.len());
         writer.write_u32(0);
@@ -314,7 +385,7 @@ fn build_index_bytes(
 
     writer.buffer[offset_slots[0]..offset_slots[0] + 4].copy_from_slice(&root_offset.to_le_bytes());
 
-    for (storage_index, storage) in index.storages.iter().enumerate() {
+    for (storage_index, storage) in storages.iter().enumerate() {
         let metadata_offset = writer.buffer.len() as u32;
         writer.buffer[offset_slots[storage_index + 1]..offset_slots[storage_index + 1] + 4]
             .copy_from_slice(&metadata_offset.to_le_bytes());
@@ -385,9 +456,16 @@ fn replace_file_atomically(target_path: &Path, temp_path: &Path) -> Result<(), a
 #[cfg(test)]
 mod tests {
     use super::{decode_vfs_string, write_vfs_string, VfsIndex};
-    use crate::{RoseFileReader, RoseFileWriter, VfsPathBuf, VirtualFilesystemDevice};
+    use crate::{RoseFileReader, RoseFileWriter, VfsFile, VfsPathBuf, VirtualFilesystemDevice};
     use std::{collections::HashMap, path::Path};
     use tempfile::tempdir;
+
+    fn file_bytes(file: VfsFile<'_>) -> Vec<u8> {
+        match file {
+            VfsFile::Buffer(bytes) => bytes,
+            VfsFile::View(bytes) => bytes.to_vec(),
+        }
+    }
 
     fn create_test_vfs(root: &Path) {
         let storage_bytes = b"HELLOWORLD".to_vec();
@@ -460,10 +538,7 @@ mod tests {
         let index_path = dir.path().join("data.idx");
         let vfs = VfsIndex::load(&index_path).unwrap();
         assert_eq!(
-            match vfs.open_file(&"3DDATA/STB/LIST_NPC.STB".into()).unwrap() {
-                crate::VfsFile::View(bytes) => bytes,
-                crate::VfsFile::Buffer(_) => unreachable!(),
-            },
+            file_bytes(vfs.open_file(&"3DDATA/STB/LIST_NPC.STB".into()).unwrap()),
             b"HELLO"
         );
 
@@ -479,23 +554,65 @@ mod tests {
 
         let reloaded = VfsIndex::load(&index_path).unwrap();
         assert_eq!(
-            match reloaded
-                .open_file(&"3DDATA/STB/LIST_NPC.STB".into())
-                .unwrap()
-            {
-                crate::VfsFile::View(bytes) => bytes,
-                crate::VfsFile::Buffer(_) => unreachable!(),
-            },
+            file_bytes(
+                reloaded
+                    .open_file(&"3DDATA/STB/LIST_NPC.STB".into())
+                    .unwrap()
+            ),
             b"HELLO"
         );
         assert_eq!(
-            match reloaded
-                .open_file(&"3DDATA/STB/LIST_SELL.STB".into())
-                .unwrap()
-            {
-                crate::VfsFile::View(bytes) => bytes,
-                crate::VfsFile::Buffer(_) => unreachable!(),
-            },
+            file_bytes(
+                reloaded
+                    .open_file(&"3DDATA/STB/LIST_SELL.STB".into())
+                    .unwrap()
+            ),
+            b"STORE!"
+        );
+    }
+
+    #[test]
+    fn refresh_sees_external_vfs_rewrite() {
+        let dir = tempdir().unwrap();
+        create_test_vfs(dir.path());
+
+        let index_path = dir.path().join("data.idx");
+        let stale_vfs = VfsIndex::load(&index_path).unwrap();
+        assert_eq!(
+            file_bytes(
+                stale_vfs
+                    .open_file(&"3DDATA/STB/LIST_SELL.STB".into())
+                    .unwrap()
+            ),
+            b"WORLD"
+        );
+
+        let writer_vfs = VfsIndex::load(&index_path).unwrap();
+        let replacements = HashMap::from([(
+            VfsPathBuf::new("3DDATA/STB/LIST_SELL.STB"),
+            b"STORE!".to_vec(),
+        )]);
+        writer_vfs
+            .rewrite_files_without_backups(&index_path, &replacements)
+            .unwrap();
+
+        assert_eq!(
+            file_bytes(
+                stale_vfs
+                    .open_file(&"3DDATA/STB/LIST_SELL.STB".into())
+                    .unwrap()
+            ),
+            b"WORLD"
+        );
+
+        stale_vfs.refresh().unwrap();
+
+        assert_eq!(
+            file_bytes(
+                stale_vfs
+                    .open_file(&"3DDATA/STB/LIST_SELL.STB".into())
+                    .unwrap()
+            ),
             b"STORE!"
         );
     }

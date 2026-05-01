@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bevy::{
     app::ScheduleRunnerPlugin,
@@ -9,6 +9,7 @@ use bevy::{
     MinimalPlugins,
 };
 use crossbeam_channel::Receiver;
+use rose_file_readers::VirtualFilesystem;
 
 use crate::game::{
     bots::BotPlugin,
@@ -20,7 +21,7 @@ use crate::game::{
     },
     messages::control::ControlMessage,
     resources::{
-        BotList, ClientEntityList, ControlChannel, GameConfig, GameData, LoginTokens,
+        BotList, ClientEntityList, ControlChannel, GameConfig, GameData, GameDataVfs, LoginTokens,
         OnlineFriends, ServerList, ServerMessages, WorldRates, WorldTime, ZoneList,
     },
     systems::{
@@ -53,7 +54,12 @@ impl GameWorld {
         Self { control_rx }
     }
 
-    pub fn run(&mut self, game_config: GameConfig, game_data: GameData) {
+    pub fn run(
+        &mut self,
+        game_config: GameConfig,
+        game_data: GameData,
+        game_data_vfs: Arc<VirtualFilesystem>,
+    ) {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
             Duration::from_secs_f64(1.0 / 60.0),
@@ -71,6 +77,7 @@ impl GameWorld {
         app.insert_resource(WorldTime::new());
         app.insert_resource(ZoneList::new());
         app.insert_resource(game_config);
+        app.insert_resource(GameDataVfs::new(game_data_vfs));
         app.insert_resource(game_data);
 
         app.add_event::<BankEvent>()

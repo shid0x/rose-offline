@@ -31,6 +31,22 @@ impl MonsterSpawnPoint {
         self.time_since_last_check = self.time_since_last_check.saturating_sub(self.interval);
         true
     }
+
+    pub fn apply_spawn_data(&mut self, spawn_point: &ZoneMonsterSpawnPoint) {
+        self.basic_spawns = spawn_point.basic_spawns.clone();
+        self.tactic_spawns = spawn_point.tactic_spawns.clone();
+        self.interval = Self::interval_from_seconds(spawn_point.interval);
+        self.limit_count = spawn_point.limit_count;
+        self.range = spawn_point.range;
+        self.tactic_points = spawn_point.tactic_points;
+        self.time_since_last_check = self.time_since_last_check.min(self.interval);
+    }
+
+    pub fn reset_for_live_reload(&mut self) {
+        self.num_alive_monsters = 0;
+        self.current_tactics_value = 1;
+        self.time_since_last_check = self.interval;
+    }
 }
 
 impl From<&ZoneMonsterSpawnPoint> for MonsterSpawnPoint {
@@ -63,6 +79,9 @@ mod tests {
 
     fn test_zone_spawn_point(interval: u32) -> ZoneMonsterSpawnPoint {
         ZoneMonsterSpawnPoint {
+            source_block_x: 0,
+            source_block_y: 0,
+            source_spawn_index: 0,
             position: Vec3::ZERO,
             basic_spawns: vec![(NpcId::new(1).unwrap(), 1)],
             tactic_spawns: Vec::new(),
@@ -91,5 +110,27 @@ mod tests {
 
         assert!(!spawn_point.advance_spawn_check(Duration::from_secs(29)));
         assert!(spawn_point.advance_spawn_check(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn applying_spawn_data_preserves_runtime_alive_count_until_reset() {
+        let mut spawn_point = MonsterSpawnPoint::from(&test_zone_spawn_point(30));
+        spawn_point.num_alive_monsters = 3;
+
+        let mut updated = test_zone_spawn_point(10);
+        updated.limit_count = 5;
+        updated.range = 25;
+        spawn_point.apply_spawn_data(&updated);
+
+        assert_eq!(spawn_point.num_alive_monsters, 3);
+        assert_eq!(spawn_point.interval, Duration::from_secs(10));
+        assert_eq!(spawn_point.limit_count, 5);
+        assert_eq!(spawn_point.range, 25);
+
+        spawn_point.reset_for_live_reload();
+
+        assert_eq!(spawn_point.num_alive_monsters, 0);
+        assert_eq!(spawn_point.current_tactics_value, 1);
+        assert_eq!(spawn_point.time_since_last_check, Duration::from_secs(10));
     }
 }

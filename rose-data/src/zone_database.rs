@@ -3,7 +3,7 @@ use bevy::{
     reflect::Reflect,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, num::NonZeroU16, str::FromStr, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU16, path::PathBuf, str::FromStr, sync::Arc};
 
 use crate::{NpcConversationId, NpcId, SkyboxId, StringDatabase};
 
@@ -13,6 +13,9 @@ pub struct ZoneId(pub NonZeroU16);
 id_wrapper_impl!(ZoneId, NonZeroU16, u16);
 
 pub struct ZoneMonsterSpawnPoint {
+    pub source_block_x: u32,
+    pub source_block_y: u32,
+    pub source_spawn_index: usize,
     pub position: Vec3,
     pub basic_spawns: Vec<(NpcId, usize)>,
     pub tactic_spawns: Vec<(NpcId, usize)>,
@@ -38,6 +41,7 @@ pub struct ZoneEventObject {
 
 pub struct ZoneData {
     pub id: ZoneId,
+    pub source_zone_path: PathBuf,
     pub name: &'static str,
     pub description: &'static str,
     pub pvp_state: u32,

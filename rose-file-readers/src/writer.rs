@@ -66,6 +66,12 @@ impl RoseFileWriter {
         self.buffer.put(bytes);
     }
 
+    pub fn write_u8_length_string(&mut self, string: &str) {
+        let (encoded, _, _) = EUC_KR.encode(string);
+        self.write_u8(encoded.len() as u8);
+        self.buffer.put(encoded.as_ref());
+    }
+
     pub fn write_u16_length_string(&mut self, string: &str) {
         let (encoded, _, _) = EUC_KR.encode(string);
         self.write_u16_length_bytes(&encoded);

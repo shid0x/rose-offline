@@ -7,9 +7,9 @@ use crate::game::{
         NPC_OBJECT_VARIABLES_COUNT,
     },
     components::{
-        ClientEntityType, Command, EventObject, HealthPoints, Level, MonsterSpawnPoint, MotionData,
-        MoveMode, MoveSpeed, NextCommand, Npc, NpcAi, NpcStandingDirection, ObjectVariables,
-        Position, StatusEffects, StatusEffectsRegen, Team,
+        ClientEntityType, Command, EventObject, HealthPoints, Level, MonsterSpawnPoint,
+        MonsterSpawnSource, MotionData, MoveMode, MoveSpeed, NextCommand, Npc, NpcAi,
+        NpcStandingDirection, ObjectVariables, Position, StatusEffects, StatusEffectsRegen, Team,
     },
     pvp::zone_is_initially_pvp_enabled,
     resources::{ClientEntityList, GameData, ZoneList},
@@ -73,6 +73,12 @@ pub fn startup_zones_system(
 
                 commands.spawn((
                     MonsterSpawnPoint::from(spawn),
+                    MonsterSpawnSource::new(
+                        zone_data.id,
+                        spawn.source_block_x,
+                        spawn.source_block_y,
+                        spawn.source_spawn_index,
+                    ),
                     Position::new(spawn.position, zone_data.id),
                 ));
             }
