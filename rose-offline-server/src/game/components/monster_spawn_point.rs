@@ -43,9 +43,13 @@ impl MonsterSpawnPoint {
     }
 
     pub fn reset_for_live_reload(&mut self) {
+        self.reset_for_live_reload_with_delay(Duration::ZERO);
+    }
+
+    pub fn reset_for_live_reload_with_delay(&mut self, delay: Duration) {
         self.num_alive_monsters = 0;
         self.current_tactics_value = 1;
-        self.time_since_last_check = self.interval;
+        self.time_since_last_check = self.interval.saturating_sub(delay);
     }
 }
 
@@ -132,5 +136,17 @@ mod tests {
         assert_eq!(spawn_point.num_alive_monsters, 0);
         assert_eq!(spawn_point.current_tactics_value, 1);
         assert_eq!(spawn_point.time_since_last_check, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn live_reload_reset_can_stagger_spawn_eligibility() {
+        let mut spawn_point = MonsterSpawnPoint::from(&test_zone_spawn_point(30));
+
+        spawn_point.reset_for_live_reload_with_delay(Duration::from_secs(2));
+
+        assert!(!spawn_point.advance_spawn_check(Duration::from_secs(1)));
+        assert!(spawn_point.advance_spawn_check(Duration::from_secs(1)));
+        assert_eq!(spawn_point.num_alive_monsters, 0);
+        assert_eq!(spawn_point.current_tactics_value, 1);
     }
 }

@@ -4,6 +4,7 @@ mod control_channel;
 mod game_config;
 mod game_data;
 mod game_data_vfs;
+mod live_spawn_reload_queue;
 mod login_tokens;
 mod online_friends;
 mod server_list;
@@ -18,6 +19,10 @@ pub use control_channel::ControlChannel;
 pub use game_config::GameConfig;
 pub use game_data::GameData;
 pub use game_data_vfs::GameDataVfs;
+pub use live_spawn_reload_queue::{
+    LiveSpawnReloadJob, LiveSpawnReloadQueue, LIVE_SPAWN_RELOAD_DESPAWNS_PER_TICK,
+    LIVE_SPAWN_RELOAD_STAGGER,
+};
 pub use login_tokens::{LoginToken, LoginTokens};
 pub use online_friends::{OnlineFriend, OnlineFriends};
 pub use server_list::{GameServer, ServerList, WorldServer};

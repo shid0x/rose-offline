@@ -22,7 +22,8 @@ use crate::game::{
     messages::control::ControlMessage,
     resources::{
         BotList, ClientEntityList, ControlChannel, GameConfig, GameData, GameDataVfs, LoginTokens,
-        OnlineFriends, ServerList, ServerMessages, WorldRates, WorldTime, ZoneList,
+        LiveSpawnReloadQueue, OnlineFriends, ServerList, ServerMessages, WorldRates, WorldTime,
+        ZoneList,
     },
     systems::{
         ability_values_changed_system, ability_values_update_character_system,
@@ -32,8 +33,8 @@ use crate::game::{
         equipment_event_system, experience_points_system, expire_time_system,
         game_server_authentication_system, game_server_join_system, game_server_main_system,
         item_life_system, login_server_authentication_system, login_server_system,
-        monster_spawn_system, move_speed_sync_system, npc_ai_system, npc_store_system,
-        party_member_event_system, party_member_update_info_system, party_system,
+        live_spawn_reload_system, monster_spawn_system, move_speed_sync_system, npc_ai_system,
+        npc_store_system, party_member_event_system, party_member_update_info_system, party_system,
         party_update_average_level_system, passive_recovery_system, personal_store_system,
         pickup_item_system, quest_system, revive_event_system, reward_item_system, save_system,
         server_messages_system, skill_effect_system, startup_clans_system, startup_zones_system,
@@ -70,6 +71,7 @@ impl GameWorld {
         app.insert_resource(ClientEntityList::new(&game_data.zones));
         app.insert_resource(ControlChannel::new(self.control_rx.clone()));
         app.insert_resource(LoginTokens::new());
+        app.insert_resource(LiveSpawnReloadQueue::default());
         app.insert_resource(OnlineFriends::default());
         app.insert_resource(ServerList::new());
         app.insert_resource(ServerMessages::new());
@@ -124,8 +126,13 @@ impl GameWorld {
                     game_server_authentication_system,
                     game_server_join_system,
                     (game_server_main_system, revive_event_system).chain(),
-                    chat_commands_system,
-                    monster_spawn_system,
+                    (
+                        chat_commands_system,
+                        live_spawn_reload_system,
+                        apply_deferred,
+                        monster_spawn_system,
+                    )
+                        .chain(),
                     summon_points_dead_cleanup_system,
                     summon_points_owner_cleanup_system,
                     summon_points_owner_reset_system,

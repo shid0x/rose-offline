@@ -8,7 +8,7 @@ use rose_data::NpcId;
 use crate::game::{
     bundles::MonsterBundle,
     components::{MonsterSpawnPoint, Position, SpawnOrigin, Team},
-    resources::{ClientEntityList, GameData, ZoneList},
+    resources::{ClientEntityList, GameData, LiveSpawnReloadQueue, ZoneList},
 };
 
 fn build_spawn_queue(spawn_point: &mut MonsterSpawnPoint) -> Vec<(NpcId, usize)> {
@@ -150,9 +150,14 @@ pub fn monster_spawn_system(
     mut client_entity_list: ResMut<ClientEntityList>,
     game_data: Res<GameData>,
     zone_list: Res<ZoneList>,
+    live_spawn_reload_queue: Res<LiveSpawnReloadQueue>,
 ) {
     query.for_each_mut(
         |(spawn_point_entity, mut spawn_point, spawn_point_position)| {
+            if live_spawn_reload_queue.is_spawn_point_blocked(spawn_point_entity) {
+                return;
+            }
+
             if !zone_list.get_monster_spawns_enabled(spawn_point_position.zone_id) {
                 return;
             }

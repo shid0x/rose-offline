@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     f32::consts::PI,
     num::{ParseFloatError, ParseIntError},
     time::{Duration, Instant},
@@ -42,21 +43,24 @@ use crate::game::{
     },
     bundles::{
         ability_values_add_value, ability_values_set_value, client_entity_teleport_zone,
-        client_entity_leave_zone, CharacterBundle, ItemDropBundle, MonsterBundle,
+        CharacterBundle, ItemDropBundle, MonsterBundle,
     },
     components::{
         AbilityValues, Account, BasicStats, CharacterInfo, ClanMembership, ClientEntity,
         ClientEntitySector, ClientEntityType, Command, Cooldowns, DamageSources,
         EquipmentItemDatabase, GameClient, HealthPoints, Inventory, InventoryPageType, Level,
-        ManaPoints, Money, MonsterSpawnPoint, MonsterSpawnSource, MotionData, MoveMode, MoveSpeed,
-        NextCommand, PartyMembership, PassiveRecoveryTime, PersonalStore, Position,
-        RecoveryRateBonus, SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints,
-        StatusEffects, StatusEffectsRegen, Team, UnionMembership,
+        ManaPoints, Money, MonsterSpawnSource, MotionData, MoveMode, MoveSpeed, NextCommand,
+        PartyMembership, PassiveRecoveryTime, PersonalStore, Position, RecoveryRateBonus,
+        SkillList, SkillPoints, SpawnOrigin, Stamina, StatPoints, StatusEffects,
+        StatusEffectsRegen, Team, UnionMembership,
         PERSONAL_STORE_ITEM_SLOTS,
     },
     events::{ChatCommandEvent, ClanEvent, DamageEvent, RewardItemEvent, RewardXpEvent},
     messages::server::ServerMessage,
-    resources::{BotList, BotListEntry, ClientEntityList, GameDataVfs, ServerMessages, WorldRates},
+    resources::{
+        BotList, BotListEntry, ClientEntityList, GameDataVfs, LiveSpawnReloadJob,
+        LiveSpawnReloadQueue, ServerMessages, WorldRates,
+    },
     GameData,
 };
 
@@ -74,15 +78,11 @@ pub struct ChatCommandParams<'w, 's> {
     time: Res<'w, Time>,
     world_rates: ResMut<'w, WorldRates>,
     game_data_vfs: Res<'w, GameDataVfs>,
+    live_spawn_reload_queue: ResMut<'w, LiveSpawnReloadQueue>,
     spawn_point_query: Query<
         'w,
         's,
-        (
-            Entity,
-            &'static MonsterSpawnSource,
-            &'static mut MonsterSpawnPoint,
-            &'static mut Position,
-        ),
+        (Entity, &'static MonsterSpawnSource),
         bevy::ecs::query::Without<GameClient>,
     >,
     spawned_monster_query: Query<
@@ -687,7 +687,7 @@ fn create_spawn_point_from_ifo(
     })
 }
 
-fn reload_monster_spawn_block(
+fn queue_monster_spawn_block_reload(
     chat_command_params: &mut ChatCommandParams,
     zone_id: ZoneId,
     block_x: u32,
@@ -744,14 +744,14 @@ fn reload_monster_spawn_block(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut reloaded_spawn_entities = HashSet::new();
-    for (entity, source, _, _) in chat_command_params.spawn_point_query.iter_mut() {
+    for (entity, source) in chat_command_params.spawn_point_query.iter() {
         if source.zone_id == zone_id && source.block_x == block_x && source.block_y == block_y {
             reloaded_spawn_entities.insert(entity);
         }
     }
 
-    let mut despawned_monster_count = 0;
-    for (monster_entity, spawn_origin, client_entity, client_entity_sector, position) in
+    let mut pending_monsters = VecDeque::new();
+    for (monster_entity, spawn_origin, _, _, _) in
         chat_command_params.spawned_monster_query.iter()
     {
         let SpawnOrigin::MonsterSpawnPoint(spawn_point_entity, _) = spawn_origin else {
@@ -761,49 +761,23 @@ fn reload_monster_spawn_block(
             continue;
         }
 
-        client_entity_leave_zone(
-            &mut chat_command_params.commands,
-            &mut chat_command_params.client_entity_list,
-            monster_entity,
-            client_entity,
-            client_entity_sector,
-            position,
-        );
-        chat_command_params.commands.entity(monster_entity).despawn();
-        despawned_monster_count += 1;
+        pending_monsters.push_back(monster_entity);
     }
 
-    let mut found_spawns = vec![false; reloaded_spawns.len()];
-    for (entity, source, mut spawn_point, mut position) in
-        chat_command_params.spawn_point_query.iter_mut()
-    {
-        if source.zone_id != zone_id || source.block_x != block_x || source.block_y != block_y {
-            continue;
-        }
-
-        if let Some(reloaded_spawn) = reloaded_spawns.get(source.spawn_index) {
-            found_spawns[source.spawn_index] = true;
-            spawn_point.apply_spawn_data(reloaded_spawn);
-            spawn_point.reset_for_live_reload();
-            position.position = reloaded_spawn.position;
-        } else {
-            chat_command_params.commands.entity(entity).despawn();
-        }
-    }
-
-    for (source_spawn_index, reloaded_spawn) in reloaded_spawns.iter().enumerate() {
-        if found_spawns[source_spawn_index] {
-            continue;
-        }
-
-        chat_command_params.commands.spawn((
-            MonsterSpawnPoint::from(reloaded_spawn),
-            MonsterSpawnSource::new(zone_id, block_x, block_y, source_spawn_index),
-            Position::new(reloaded_spawn.position, zone_id),
+    let spawn_count = reloaded_spawns.len();
+    let monster_count = pending_monsters.len();
+    chat_command_params
+        .live_spawn_reload_queue
+        .push(LiveSpawnReloadJob::new(
+            zone_id,
+            block_x,
+            block_y,
+            reloaded_spawns,
+            reloaded_spawn_entities,
+            pending_monsters,
         ));
-    }
 
-    Ok((reloaded_spawns.len(), despawned_monster_count))
+    Ok((spawn_count, monster_count))
 }
 
 fn handle_chat_command(
@@ -1005,8 +979,8 @@ fn handle_chat_command(
             let zone_id = arg_matches.value_of("zone").unwrap().parse::<ZoneId>()?;
             let block_x = arg_matches.value_of("block_x").unwrap().parse::<u32>()?;
             let block_y = arg_matches.value_of("block_y").unwrap().parse::<u32>()?;
-            let (spawn_count, despawned_monster_count) =
-                reload_monster_spawn_block(chat_command_params, zone_id, block_x, block_y)?;
+            let (spawn_count, queued_monster_count) =
+                queue_monster_spawn_block_reload(chat_command_params, zone_id, block_x, block_y)?;
 
             chat_command_user
                 .game_client
@@ -1014,12 +988,12 @@ fn handle_chat_command(
                 .send(ServerMessage::Whisper {
                     from: String::from("SERVER"),
                     text: format!(
-                        "Reloaded {} monster spawn points for zone {} block {}_{}; replaced {} live monsters",
+                        "Queued reload of {} monster spawn points for zone {} block {}_{}; draining {} live monsters",
                         spawn_count,
                         zone_id.get(),
                         block_x,
                         block_y,
-                        despawned_monster_count,
+                        queued_monster_count,
                     ),
                 })
                 .ok();

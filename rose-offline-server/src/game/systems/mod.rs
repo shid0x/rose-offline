@@ -15,6 +15,7 @@ mod experience_points_system;
 mod expire_time_system;
 mod game_server_system;
 mod item_life_system;
+mod live_spawn_reload_system;
 mod login_server_system;
 mod monster_spawn_system;
 mod move_speed_sync_system;
@@ -61,6 +62,7 @@ pub use game_server_system::{
     game_server_authentication_system, game_server_join_system, game_server_main_system,
 };
 pub use item_life_system::item_life_system;
+pub use live_spawn_reload_system::live_spawn_reload_system;
 pub use login_server_system::{login_server_authentication_system, login_server_system};
 pub use monster_spawn_system::monster_spawn_system;
 pub use move_speed_sync_system::move_speed_sync_system;
